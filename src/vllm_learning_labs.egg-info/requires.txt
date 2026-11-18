@@ -1,0 +1,12 @@
+numpy>=2.4.6
+torch<3,>=2.7
+
+[hf]
+transformers<5,>=4.51
+safetensors<1,>=0.4.3
+
+[lab]
+pytest<10,>=8
+fastapi<1,>=0.115
+httpx<1,>=0.28
+uvicorn<1,>=0.30

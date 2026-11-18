@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: vllm-learning-labs
+Version: 0.1.0
+Requires-Python: <3.14,>=3.11
+Requires-Dist: numpy>=2.4.6
+Requires-Dist: torch<3,>=2.7
+Provides-Extra: lab
+Requires-Dist: pytest<10,>=8; extra == "lab"
+Requires-Dist: fastapi<1,>=0.115; extra == "lab"
+Requires-Dist: httpx<1,>=0.28; extra == "lab"
+Requires-Dist: uvicorn<1,>=0.30; extra == "lab"
+Provides-Extra: hf
+Requires-Dist: transformers<5,>=4.51; extra == "hf"
+Requires-Dist: safetensors<1,>=0.4.3; extra == "hf"
