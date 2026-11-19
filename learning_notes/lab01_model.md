@@ -478,3 +478,11 @@ logits 是未经过 softmax 的原始分数。若 `tie_word_embeddings=True`，L
 tied LM head 与 embedding 应共享同一个 Parameter，只加载 `model.embed_tokens.weight`，不能因为没有独立 `lm_head.weight` 而报错；非 tied 时才要求并加载该 key。
 
 当前 Lab 01 全部 `6 passed`。权重映射、无 bias 投影、Pre-Norm 残差、最终 Norm 和 tied LM head 均已接通。进入 Lab 02 前需注意：`query_start` 必须继续传入 `causal_gqa`；若 RoPE 使用了非零起点而 attention mask 仍固定从 0 开始，分段 prefill/decode 的可见范围会不一致。
+
+## 后训练与“推理时参数固定”
+
+推理时参数固定，是指部署某个已经训练完成的模型版本后，服务请求不会继续更新权重；它不表示预训练之后不能经过后训练形成新的权重版本。SFT、基于偏好的优化和强化学习后训练，都是通过训练数据、偏好或奖励对参数做更新，再把更新后的参数冻结用于推理。
+
+若基础权重冻结但训练 LoRA / adapter，原矩阵 `W` 可以不变，有效权重却变成 `W + ΔW`；新增 adapter 也是模型参数的一部分。因此“基础模型参数没变”不等于“整个模型的有效参数没变”。
+
+如果两个版本的全部有效参数逐元素相同，tokenizer、模型配置和输入 token 也相同，那么 logits 函数完全相同，后训练不可能在不留下任何参数变化的情况下改变模型本身。观察到的行为差异只能来自采样随机性、system prompt、解码参数、工具、检索、路由或其他外部系统。这些手段能改变产品行为，但不属于“模型权重没有变化却通过后训练增强了模型本身”。

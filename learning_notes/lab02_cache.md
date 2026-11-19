@@ -1,6 +1,6 @@
 # Lab 02 · 单请求 Prefill / Decode
 
-**状态：进行中。连续缓存与绝对位置 causal mask 已通过，开始接入模型 forward。**
+**状态：进行中。连续缓存、绝对位置 causal mask 与分段 forward 对拍已通过，开始贪心生成。**
 
 Lab 01 已经能把 `[B, T]` 的输入 token ID 转成 `[B, T, vocab_size]` 的 logits。本 lab 用同一个模型生成多个 token，并以完整序列重算为基线，验证逐步复用历史 K/V 的结果。模型结构和算子见 [Lab 01](lab01_model.md)。
 
@@ -191,7 +191,7 @@ V: w_v(x) → 拆成 KV heads → 写入
 
 ## 当前实验记录
 
-环境为 Mac arm64 CPU、Python 3.12.4、PyTorch 2.15.0。复查空读和构造器的零值校验后，连续缓存与绝对位置掩码用例通过，两组分段 logits 对拍失败，合计 `2 passed, 2 failed, 3 deselected`。此前 Lab 01 的 6 项用例均通过，贪心生成尚待实现，真权重用例因未设置 `QWEN_MODEL_DIR` 跳过。Lab 06 的按行 RoPE 测试此前单独验证过，`1 passed`。
+环境为 Mac arm64 CPU、Python 3.12.4、PyTorch 2.15.0。连续缓存、绝对位置掩码和两组分段 logits 对拍均已通过，Lab 01 的 6 项用例保持通过。修正读回 K/V 后又拼接当前 K/V 的问题后，`(1, 2, 3)` 分段在第 0 层实测 `(query_start, Tq, Tk, Tv)` 为 `[(0,1,1,1), (1,2,3,3), (3,3,6,6)]`，最终两层缓存长度均为 6。贪心生成尚待实现，真权重用例因未设置 `QWEN_MODEL_DIR` 跳过。Lab 06 的按行 RoPE 测试此前单独验证过，`1 passed`。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider \
@@ -225,3 +225,19 @@ with torch.inference_mode():
 | 全部位置可见 | `1.19e-7` | `8.94e-8` | `3.21` | `0.95` |
 
 因果组的差异处于 FP32 舍入量级。全可见组中，第 0 层输入端的旧 K/V 仍一致，从第 1 层开始能观察到旧 K/V 的变化。
+
+## KV Cache、无状态 API 与 Prompt Caching
+
+单次生成中的 KV cache 是运行状态：prefill 处理当前 prompt，decode 每轮只输入上一轮生成的 token，并读取本请求的历史 K/V。无 cache 时每轮重算完整前缀，可以作为正确性基线或低效回退，但线上服务通常以 cache 路径为主。缓存中途失效时，也可以根据完整 token 前缀重新 prefill 一次来重建 K/V，不必永久退化为逐 token 全量重算。多请求 decode 时，“每轮只输入一个 token”指每个活跃请求一行，合并后是 `[B,1]`，不是整个引擎只有一个 token。
+
+KV cache 并不是 API 无状态的原因；它在单次生成内恰恰是有状态的。无状态指服务默认不在请求之间保存会话语义，因此客户端通常每次发送完整消息列表。服务端也可以用会话 ID 保存消息或缓存，但那是有状态产品架构，逻辑上下文仍由完整前缀定义。
+
+Prompt caching / prefix caching 是把可复用前缀的 K/V 跨请求保留和索引，常用于稳定的 system prompt、工具描述、文档或完全匹配的历史对话前缀。它减少的是重复 prefill，不会缩短逻辑上下文，也不会消除 decode 对历史 K/V 的读取。只有从序列起点开始完全匹配的 token 前缀才能直接复用，不能只因为两段文本相同就随意复用序列中间的 K/V；模型、tokenizer、位置和 RoPE 等约定也必须一致。
+
+| 机制 | 主要作用域 | 节省的计算 |
+| --- | --- | --- |
+| 单次请求 KV cache | 一次生成过程 | 避免 decode 重算历史 token 的隐藏状态和 K/V |
+| Prompt / prefix caching | 多个请求的相同前缀 | 避免重复 prefill 相同前缀 |
+| 会话数据库 | 跨请求产品状态 | 保存和恢复消息，不等于模型学会了用户 |
+
+缓存是性能优化，不是权重更新或长期学习。缓存淘汰只应影响性能，不应改变请求的逻辑 token 前缀。
