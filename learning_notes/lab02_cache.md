@@ -1,6 +1,6 @@
 # Lab 02 · 单请求 Prefill / Decode
 
-**状态：进行中。连续缓存、绝对位置 causal mask 与分段 forward 对拍已通过，开始贪心生成。**
+**状态：CPU toy 验收完成；真实 Qwen3 权重对拍待选做。**
 
 Lab 01 已经能把 `[B, T]` 的输入 token ID 转成 `[B, T, vocab_size]` 的 logits。本 lab 用同一个模型生成多个 token，并以完整序列重算为基线，验证逐步复用历史 K/V 的结果。模型结构和算子见 [Lab 01](lab01_model.md)。
 
@@ -191,7 +191,7 @@ V: w_v(x) → 拆成 KV heads → 写入
 
 ## 当前实验记录
 
-环境为 Mac arm64 CPU、Python 3.12.4、PyTorch 2.15.0。连续缓存、绝对位置掩码和两组分段 logits 对拍均已通过，Lab 01 的 6 项用例保持通过。修正读回 K/V 后又拼接当前 K/V 的问题后，`(1, 2, 3)` 分段在第 0 层实测 `(query_start, Tq, Tk, Tv)` 为 `[(0,1,1,1), (1,2,3,3), (3,3,6,6)]`，最终两层缓存长度均为 6。贪心生成尚待实现，真权重用例因未设置 `QWEN_MODEL_DIR` 跳过。Lab 06 的按行 RoPE 测试此前单独验证过，`1 passed`。
+环境为 Mac arm64 CPU、Python 3.12.4、PyTorch 2.15.0。连续缓存、绝对位置掩码、两组分段 logits 对拍和贪心生成均已通过，Lab 01 与 Lab 02 合计 `12 passed, 1 deselected`。修正读回 K/V 后又拼接当前 K/V 的问题后，`(1, 2, 3)` 分段在第 0 层实测 `(query_start, Tq, Tk, Tv)` 为 `[(0,1,1,1), (1,2,3,3), (3,3,6,6)]`，最终两层缓存长度均为 6。无 cache 生成的输入序列已验证逐轮只增长一个 token；cache 生成 7 个 token 时，输入形状为一次 `[1,4]` prefill 和六次 `[1,1]` decode，`start_pos` 依次为 `0,4,5,6,7,8,9`，最终两层缓存长度均为 10。真权重用例因未设置 `QWEN_MODEL_DIR` 跳过。Lab 06 的按行 RoPE 测试此前单独验证过，`1 passed`。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider \
@@ -241,3 +241,15 @@ Prompt caching / prefix caching 是把可复用前缀的 K/V 跨请求保留和�
 | 会话数据库 | 跨请求产品状态 | 保存和恢复消息，不等于模型学会了用户 |
 
 缓存是性能优化，不是权重更新或长期学习。缓存淘汰只应影响性能，不应改变请求的逻辑 token 前缀。
+
+## 贪心生成中的标量与形状
+
+Embedding 索引满足 `[V,D][input_ids] -> input_ids.shape + [D]`。因此二维 `[B,T]` 的 token ID 会得到 `[B,T,D]`；若误传三维 `[1,1,1]`，结果就会成为四维 `[1,1,1,D]`。看到 embedding 多出一维时，先检查调用方的 `input_ids`，不是修改 embedding 索引公式。
+
+`next_logits` 的形状为 `[B,V]`，单请求下 `argmax(dim=-1)` 得到 `[1]`。再 `unsqueeze(0)` 会成为 `[1,1]`；随后对这个 Tensor 再 `unsqueeze(0)` 就会得到三维 `[1,1,1]` 的 decode 输入。`greedy_generate` 的返回约定是 `list[int]`，采样辅助函数应通过 `.item()` 返回 Python 整数。构造单 token decode 输入时直接使用 `[[next_id]]` 得到 `[1,1]`，不要在已经带两个维度的 Tensor 上重复增加轴。
+
+位置游标同样应按输入计算：prompt 长度为 `P`，已经输出 `N` 个 token后，下一轮输入的是第 `N` 个输出（从 1 开始），其位置为 `P+N-1`。直接使用 `P+N` 会跳过正确位置并导致 cache 追加位置校验失败。也可以让 `start_pos` 在每轮 forward 后增加本轮输入长度，避免手写输出数量公式。
+
+无 cache 分支中的 `input_ids` 已经包含上一轮使用的完整前缀，因此每轮只能再拼接最新的 `generated_ids[-1]`。若再次拼接整个 `generated_ids`，早期生成 token 会被重复加入。固定 logits 下 prompt 长度为 2、生成 4 轮时，错误实现的输入长度实测为 `[2,3,5,8]`，正确应为 `[2,3,4,5]`。Toy 模型可能连续选中同一个 ID，使这种历史重复仍通过最终 token 对拍，因此还应检查模型每轮收到的准确输入。
+
+输入张量不能只按 CPU toy 环境硬编码 device。可从模型参数取得初始 device，后续新 token 张量沿用 `input_ids.device` 和 `torch.long`，否则真实 CUDA 模型会在 embedding 或后续运算中遇到跨设备错误。
