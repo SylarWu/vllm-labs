@@ -152,7 +152,7 @@ class TinyQwen3Attention(nn.Module):
         k = apply_rope(k, positions, self.rope_theta)
 
         # [B, H_q, T_q, D] -> [B, T_q, H_q, D] -> [B, T_q, H_q * D]
-        attn = causal_gqa(q, k, v, query_start=0).permute(0, 2, 1, 3).reshape(batch_size, token_length, -1)
+        attn = causal_gqa(q, k, v, query_start=query_start).permute(0, 2, 1, 3).reshape(batch_size, token_length, -1)
         # [B, T_q, hidden_size]
         return self.w_out(attn)
 

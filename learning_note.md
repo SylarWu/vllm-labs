@@ -507,3 +507,5 @@ logits 是未经过 softmax 的原始分数。若 `tie_word_embeddings=True`，L
 `from_state_dict` 推荐先创建模块，再在 `torch.no_grad()` 下用 `Parameter.copy_` 加载。复制前检查 key 是否存在及形状是否一致，避免缺失权重被随机初始化掩盖。源权重到目标参数的复制可以完成 dtype 转换；后续 `model.to(device,dtype)` 依赖参数已正确注册。
 
 tied LM head 与 embedding 应共享同一个 Parameter，只加载 `model.embed_tokens.weight`，不能因为没有独立 `lm_head.weight` 而报错；非 tied 时才要求并加载该 key。
+
+当前 Lab 01 全部 `6 passed`。权重映射、无 bias 投影、Pre-Norm 残差、最终 Norm 和 tied LM head 均已接通。进入 Lab 02 前需注意：`query_start` 必须继续传入 `causal_gqa`；若 RoPE 使用了非零起点而 attention mask 仍固定从 0 开始，分段 prefill/decode 的可见范围会不一致。
