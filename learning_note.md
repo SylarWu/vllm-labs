@@ -495,3 +495,15 @@ input_ids [B,T] → hidden [B,T,D_model] → logits [B,T,V]
 ```
 
 logits 是未经过 softmax 的原始分数。若 `tie_word_embeddings=True`，LM head 复用 embedding 权重，权重文件可能不含 `lm_head.weight`。使用 `nn.ModuleList` 注册各层，保证 `.parameters()` 和 `.to(device,dtype)` 能遍历它们。
+
+### 权重加载前的结构检查
+
+- Qwen3 使用的是 RMSNorm，不能用带 mean 居中和 bias 的 `nn.LayerNorm` 替代。
+- Qwen3 本实验覆盖的 attention/MLP 投影均无 bias，创建 `nn.Linear` 时应显式 `bias=False`，否则默认 bias 会留下未加载的随机参数。
+- `o_proj` 的输入宽度是 `Hq*D`，不是 `Hq`。
+- `apply_rope` 的第二个参数是位置 ID，不是 QK Norm 权重。位置由 `arange(start_pos,start_pos+T)` 构造。
+- 所有 Decoder Layer 后还需要最终 RMSNorm 和 LM head，forward 返回 `[B,T,V]` logits，不是 hidden states。
+
+`from_state_dict` 推荐先创建模块，再在 `torch.no_grad()` 下用 `Parameter.copy_` 加载。复制前检查 key 是否存在及形状是否一致，避免缺失权重被随机初始化掩盖。源权重到目标参数的复制可以完成 dtype 转换；后续 `model.to(device,dtype)` 依赖参数已正确注册。
+
+tied LM head 与 embedding 应共享同一个 Parameter，只加载 `model.embed_tokens.weight`，不能因为没有独立 `lm_head.weight` 而报错；非 tied 时才要求并加载该 key。
