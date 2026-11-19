@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -66,7 +67,37 @@ def apply_rope(x: Tensor, positions: Tensor, theta: float) -> Tensor:
 
 def causal_gqa(q: Tensor, k: Tensor, v: Tensor, *, query_start: int = 0) -> Tensor:
     """Lab 01/02. x is [B, H, T, D]. K/V begin at position zero."""
-    raise NotImplementedError("Lab 01: causal grouped-query attention")
+    original_dtype = q.dtype
+    group_num = q.shape[1] // k.shape[1]
+
+    d = q.shape[-1]
+    assert d == k.shape[-1]
+    assert d == v.shape[-1]
+
+    t_q = q.shape[-2]
+    t_kv = k.shape[-2]
+    assert t_kv == v.shape[-2]
+
+    # [B, H_q, T_q, D]
+    q_fp32 = q.float()
+    # [B, H_kv, T_kv, D] -> [B, H_q, T_kv, D]
+    k_fp32 = k.float().repeat_interleave(group_num, dim=1)
+    # [B, H_kv, T_kv, D] -> [B, H_q, T_kv, D]
+    v_fp32 = v.float().repeat_interleave(group_num, dim=1)
+
+    # [B, H_q, T_q, T_kv]
+    scaled_dot = torch.matmul(q_fp32, k_fp32.transpose(-1, -2)) / math.sqrt(d)
+
+    query_positions = query_start + torch.arange(t_q)
+    kv_positions = torch.arange(t_kv)
+    # [T_q, T_kv]
+    allowed = query_positions.unsqueeze(1) >= kv_positions.unsqueeze(0)
+
+    scaled_dot = torch.masked_fill(scaled_dot, ~allowed, float('-inf'))
+
+    out = torch.matmul(torch.softmax(scaled_dot, dim=-1), v_fp32)
+
+    return out.to(dtype=original_dtype)
 
 
 class TinyQwen3(nn.Module):

@@ -368,3 +368,62 @@ cos = angles.unsqueeze(1).cos()
 ```
 
 这样 cos/sin 可广播到 `[B,H,T,D/2]`，无需真的复制 H 份数据。
+
+## 7. Causal GQA
+
+### 基本形状与计算
+
+```text
+Q:       [B,Hq,Tq,D]
+K/V:     [B,Hkv,Tk,D]
+scores:  [B,Hq,Tq,Tk]
+output:  [B,Hq,Tq,D]
+```
+
+\[
+scores=\frac{QK^T}{\sqrt D},\qquad
+output=softmax(scores+mask)V
+\]
+
+除以 \(\sqrt D\) 防止 D 较大时点积数值过大，导致 softmax 过度饱和。`-2,-1` 转置只交换最后两维，不动 batch/head 维。
+
+### GQA 的 head 映射
+
+- MHA：`Hq=Hkv`，每个 Q head 有自己的 K/V head。
+- GQA：多个 Q head 共享一个 K/V head。
+- MQA：`Hkv=1`，所有 Q head 共享同一组 K/V。
+
+设 `groups=Hq/Hkv`，则：
+
+```python
+k = k.repeat_interleave(groups, dim=1)
+v = v.repeat_interleave(groups, dim=1)
+```
+
+例如 `[k0,k1]` 在 groups=2 时变为 `[k0,k0,k1,k1]`。这与重复整个序列的 `[k0,k1,k0,k1]` 不同。GQA 主要减少 K/V 投影和 KV cache 容量，Q 不共享也不写入 KV cache。
+
+### 带历史缓存的 causal mask
+
+query 的绝对位置为 `query_start + arange(Tq)`，key 的位置为 `arange(Tk)`，仅允许：
+
+```text
+key_position <= query_position
+```
+
+mask 形状为 `[Tq,Tk]`，可广播到 `[B,Hq,Tq,Tk]`。在 softmax 前把不允许的位置填为 `-inf`，不是等到乘 V 后才屏蔽。
+
+- 普通 prefill：`query_start=0, Tq=Tk`，形成下三角 mask。
+- 单 token decode：新 query 是最后一个位置，可以看见全部历史及自身。
+- 分段 prefill：当前 chunk 能看见全部历史，但 chunk 内仍保持因果顺序。
+
+RoPE 与 causal mask 的职责不同：RoPE 编码相对位置，causal mask 决定可见范围。
+
+### `masked_fill` 的 True/False 语义
+
+`scores.masked_fill(condition, -inf)` 会把 `condition == True` 的位置填成 `-inf`。若布尔矩阵叫 `allowed`，表示允许访问，则必须写：
+
+```python
+scores = scores.masked_fill(~allowed, float("-inf"))
+```
+
+误传 `allowed` 会反过来屏蔽历史、保留未来；当某一行全部被填成 `-inf` 时，softmax 会产生 `NaN`。此外，`query_positions` 和 `kv_positions` 应创建在 `q.device` 上，以支持 CUDA。
