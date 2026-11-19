@@ -115,9 +115,11 @@ class RMSNorm(nn.Module):
 
 
 class TinyQwen3Attention(nn.Module):
-    def __init__(self, hidden_size: int, num_q_heads: int, num_kv_heads: int, head_dim: int,
+    def __init__(self, attn_idx: int, hidden_size: int, num_q_heads: int, num_kv_heads: int, head_dim: int,
                  rms_norm_eps: float, rope_theta: float):
         super().__init__()
+
+        self.attn_idx = attn_idx
 
         self.hidden_size = hidden_size
 
@@ -136,7 +138,7 @@ class TinyQwen3Attention(nn.Module):
         self.q_rms_norm = RMSNorm(head_dim, rms_norm_eps)
         self.k_rms_norm = RMSNorm(head_dim, rms_norm_eps)
 
-    def forward(self, input: Tensor, query_start: int) -> Tensor:
+    def forward(self, input: Tensor, kv_cache: KVStore | None = None, query_start: int = 0) -> Tensor:
         batch_size, token_length, hidden_size = input.shape
 
         q = self.w_q(input).reshape(batch_size, token_length, self.num_q_heads, self.head_dim).permute(0, 2, 1, 3)
@@ -150,6 +152,18 @@ class TinyQwen3Attention(nn.Module):
 
         q = apply_rope(q, positions, self.rope_theta)
         k = apply_rope(k, positions, self.rope_theta)
+
+        if kv_cache is not None:
+            kv_cache.write(
+                self.attn_idx, query_start,
+                k.squeeze(0).permute(1, 0, 2), v.squeeze(0).permute(1, 0, 2),
+            )
+            cached_k, cached_v = kv_cache.read(self.attn_idx, query_start + token_length)
+            k = cached_k.permute(1, 0, 2).unsqueeze(0)
+            v = cached_v.permute(1, 0, 2).unsqueeze(0)
+
+            assert k.shape[-2] == query_start + q.shape[-2]
+            assert v.shape[-2] == query_start + q.shape[-2]
 
         # [B, H_q, T_q, D] -> [B, T_q, H_q, D] -> [B, T_q, H_q * D]
         attn = causal_gqa(q, k, v, query_start=query_start).permute(0, 2, 1, 3).reshape(batch_size, token_length, -1)
@@ -174,11 +188,13 @@ class TinyQwen3MLP(nn.Module):
 
 
 class TinyQwen3Decoder(nn.Module):
-    def __init__(self, config: QwenConfig):
+    def __init__(self, layer_idx: int, config: QwenConfig):
         super().__init__()
 
+        self.layer_idx = layer_idx
         self.pre_attn_layer_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.attention = TinyQwen3Attention(
+            attn_idx=layer_idx,
             hidden_size=config.hidden_size,
             num_q_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -192,10 +208,10 @@ class TinyQwen3Decoder(nn.Module):
             intermediate_size=config.intermediate_size,
         )
 
-    def forward(self, input: Tensor, query_start: int) -> Tensor:
+    def forward(self, input: Tensor, kv_cache: KVStore | None = None, query_start: int = 0) -> Tensor:
         # [batch_size, token_length, hidden_size]
         x = self.pre_attn_layer_norm(input)
-        x = self.attention(x, query_start) + input
+        x = self.attention(x, kv_cache, query_start) + input
 
         middle_x = x
 
@@ -213,7 +229,7 @@ class TinyQwen3(nn.Module):
         self.vocab = nn.Parameter(torch.randn(config.vocab_size, config.hidden_size))
 
         self.decoders = nn.ModuleList(
-            TinyQwen3Decoder(config) for _ in range(config.num_hidden_layers)
+            TinyQwen3Decoder(i, config) for i in range(config.num_hidden_layers)
         )
 
         self.final_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -321,7 +337,7 @@ class TinyQwen3(nn.Module):
         x = self._select_token(input_ids)
 
         for decoder in self.decoders:
-            x = decoder(x, start_pos)
+            x = decoder(x, cache, start_pos)
 
         x = self.final_norm(x)
 
