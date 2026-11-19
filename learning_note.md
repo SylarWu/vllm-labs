@@ -7,7 +7,7 @@
 | Lab | 主题 | 状态 | 笔记 |
 | --- | --- | --- | --- |
 | 01 | Qwen3 算子、权重映射与完整 forward | 已完成，`6 passed` | [Lab 01](learning_notes/lab01_model.md) |
-| 02 | 连续 KV cache、prefill/decode 与贪心生成 | 进行中，已核对生成时序和绝对位置掩码，下一步实现 `ContiguousKV` | [Lab 02](learning_notes/lab02_cache.md) |
+| 02 | 连续 KV cache、prefill/decode 与贪心生成 | 连续缓存与绝对位置掩码已通过，开始接入模型 forward | [Lab 02](learning_notes/lab02_cache.md) |
 | 03 | Block pool 与 block table | 未开始 | 待创建 |
 | 04 | 迭代级调度 | 未开始 | 待创建 |
 | 05 | 分页 KV 与端到端 Engine | 未开始 | 待创建 |

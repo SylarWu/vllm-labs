@@ -1,6 +1,6 @@
 # Lab 02 · 单请求 Prefill / Decode
 
-**状态：进行中。已验证绝对位置 causal mask，下一步实现 `ContiguousKV`。**
+**状态：进行中。连续缓存与绝对位置 causal mask 已通过，开始接入模型 forward。**
 
 Lab 01 已经能把 `[B, T]` 的输入 token ID 转成 `[B, T, vocab_size]` 的 logits。本 lab 用同一个模型生成多个 token，并以完整序列重算为基线，验证逐步复用历史 K/V 的结果。模型结构和算子见 [Lab 01](lab01_model.md)。
 
@@ -119,9 +119,73 @@ V: w_v(x) → 拆成 KV heads → 写入
 .venv/bin/python -m pytest -q tests/test_lab02_cache.py -k contiguous_cache
 ```
 
+## 将 KV cache 接入 TinyQwen3 Forward
+
+本步的目标是让同一段输入按不同方式切分后，各位置的 logits 与一次性完整 forward 对齐。输入仍然是一段 token ID，输出仍然是本段每个位置的 logits。带缓存路径中的 `B=1` 表示一份缓存对应一个请求。无缓存整段路径继续作为数值基线。
+
+### 从入口把状态传到 Attention
+
+- `TinyQwen3.forward` 已经接收 `cache` 和 `start_pos`。遍历 decoder 时需要知道当前 `layer_idx`。一轮 forward 的所有层处理相同的 token 位置，共享 `start_pos`，各层通过自己的 `layer_idx` 读写缓存。
+- `TinyQwen3Decoder.forward` 把这些信息传给 attention。这里继续按原有顺序执行 Pre-Norm、attention 残差、MLP 残差。
+- `TinyQwen3Attention.forward` 在 K 的 RMSNorm 与 RoPE 之后、`causal_gqa` 之前接入缓存。先把当前段的 K/V 写到当前层，再读取包括当前段在内的有效前缀。读出的前缀已经含有当前段，可直接用于 GQA。
+
+### 手推最后一段 `[3, 6)`
+
+测试把 6 个输入切成 `(1, 2, 3)` 时，第三段开始前每层已经缓存位置 `0, 1, 2`。位置 `3, 4, 5` 是本次输入。设 `S = start_pos = 3`，`T = 3`，`end_pos = S + T = 6`。Toy 模型有 `Hq=4`、`Hkv=2`、`D=8`、词表大小 `43`。
+
+| 操作 | 序列位置 | 张量形状 |
+| --- | --- | --- |
+| 当前 Q，使用绝对位置做 RoPE | `[3, 6)` | `[1, 4, 3, 8]` |
+| 当前 K/V，转换后写入当前层 | `[3, 6)` | `[1, 2, 3, 8] → [3, 2, 8]` |
+| 读取当前层的完整 K/V 前缀 | `[0, 6)` | `[6, 2, 8] → [1, 2, 6, 8]` |
+| GQA 的分数矩阵 | 每个当前 query 对全部 6 个 key | `[1, 4, 3, 6]` |
+| 本次 forward 的 logits | `[3, 6)` | `[1, 3, 43]` |
+
+缓存写入时，明确去掉 batch 轴，再交换 head 与 token 轴。注意 `T=1` 时，无参数的 `squeeze()` 还会把 token 轴去掉。换轴应使用 `transpose` 或 `permute`，`reshape` 只改变形状，无法表达这两个轴的交换。读回后交换 token 与 head 轴，再补回 batch 轴，交给原有 `causal_gqa` 做 head 展开。缓存里的历史 K 已经按各自的绝对位置旋转过。
+
+这次三个 query 在绝对位置 `3, 4, 5`，分别能读取 key `0..3`、`0..4`、`0..5`。尽管读到了整段前缀，causal mask 会屏蔽当前段内在 query 之后的位置。先写再读让 prefill 和单 token decode 用同一路径，也保证当前 query 能看见自己。`start_pos` 同时传给 RoPE 和 `causal_gqa` 的 `query_start`。每层只为当前 `T` 个位置做投影和 MLP，历史 K/V 仍会被读取来计算新 query 的 attention。
+
+### 验收与定位偏差
+
+```bash
+.venv/bin/python -m pytest -q tests/test_lab02_cache.py -k cached_logits
+.venv/bin/python -m pytest -q tests/test_lab01_model.py
+```
+
+- `(4, 1, 1)` 覆盖单 token decode 形状以及 `T=1` 时的轴变换。每轮结束时，两层的有效长度应分别达到 `[4, 4]`、`[5, 5]`、`[6, 6]`。
+- `(1, 2, 3)` 覆盖非零起点的多 token chunk，验证当前 chunk 内的未来位置仍被遮住。三轮结束长度应分别达到 `[1, 1]`、`[3, 3]`、`[6, 6]`。
+- 测试沿 token 轴拼接本次的 logits，再与无缓存整段结果比较，FP32 的 `atol=rtol=2e-5`。如果第一块过、后续块偏差大，先查每层的游标、读回的 `Tkv`、RoPE 绝对位置和 mask 的 `query_start`。
+
+接线前实测，两种切分方式的第一段最大绝对误差都约为 `2e-7`，后续各段约为 `1.02–1.16`，每一轮后缓存长度都还是 `[0, 0]`。当前 `TinyQwen3.forward` 收到了 cache 参数，但 attention 只在当前段的 K/V 上计算。两组对拍转绿后，再实现选 token 和停止条件。
+
+## 连续缓存代码复盘
+
+第一版采用 `[L, capacity, Hkv, D]` 预分配，按层切片，再用 `copy_` 写入。这些设计可以沿用。出错的是有效数据边界和切片终点。
+
+| 第一版的问题 | 原因 | 本轮实现的修正 |
+| --- | --- | --- |
+| `read(1, 2)` 读到尚未写过的位置 | `torch.empty` 分配了每层的全部容量。第 1 层即使只写了 1 项，`[:2]` 也能切出 2 项，读取方必须检查有效长度。 | `write_length[layer]` 独立记录每层的有效前缀，读取时校验 `length <= write_length[layer]`。 |
+| 从非零位置追加时切错范围 | `[start_pos:token_length]` 把新写入数量当成了绝对终点。起点为 `2`、新增 1 项时会得到 `[2:1]`。 | 用 `[start_pos:start_pos + token_length]`，此例写入 `[2:3]`。检查 `start_pos == write_length[layer]` 同时挡住覆盖和跳写。 |
+| 原校验只比了 K/V 的 token 数 | K/V 每个轴都需要吻合存储约定。`copy_` 支持广播，形状不符时有时会静默复制。 | 先核对三维形状、head 数和 head dim，再校验容量。完成 K 和 V 的复制后才推进游标，报错时已提交的前缀仍有效。 |
+
+[PyTorch `Tensor.copy_`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.copy_.html)
+
+### 接口与空区间的复查
+
+- **`Protocol` 的职责。** `KVStore` 现在声明 `read`、`write`，`ContiguousKV` 持有实际张量和游标。可以用 Java 的 `interface` 建立直觉，再记住 Python 此处使用结构化类型：方法签名匹配即可满足 `Protocol`，即使类没有显式继承它。Lab 05 的 `PagedKV` 可以沿用读写接口和自己的分页布局。[Python typing 规范](https://typing.python.org/en/latest/spec/protocol.html#protocol-members)
+- **空读与空写是两条约定。** 当前构造器明确拒绝 `num_layers=0` 和 `capacity=0`，读写也都要求非空。用 toy cache 实测，`read(layer, 0)` 在写入前后都抛出 `ValueError`，正常的非空读仍返回期望的数据。接入模型时采用先写当前 chunk、再读完整前缀的顺序，因此首轮 prefill 的读长度也是正数。
+
+### `eval()` 与 `inference_mode()` 放在哪里
+
+`model.eval()` 切换模型及其子模块的 `training` 标志，影响 Dropout、BatchNorm 等依赖该标志的层。`torch.inference_mode()` 控制当前线程在代码块或被装饰的函数中如何使用 autograd，退出后会恢复外层状态。`torch.no_grad()` 也会在作用域内停止记录反向图；如果需要把这段代码新建的张量交给后续有梯度的计算，`no_grad` 更宽松。[PyTorch Autograd](https://docs.pytorch.org/docs/2.15/notes/autograd.html#locally-disable-grad-doc)、[PyTorch inference mode](https://docs.pytorch.org/docs/2.15/generated/torch.autograd.grad_mode.inference_mode.html)
+
+用已有 toy 模型实测，调用 `.eval()` 后在默认梯度模式下，`model.training` 为 `False`，但 `logits.requires_grad` 仍为 `True`。把同一次 forward 放进 `inference_mode()`，`logits.requires_grad` 变为 `False`，退出后 `torch.is_grad_enabled()` 恢复为 `True`。同理，`torch.empty(..., requires_grad=False)` 只描述缓存张量的初始状态，默认梯度模式下，`copy_` 仍可能随来源 K/V 被记录。
+
+本项目的 `hf_io.load_model()` 和 `tests.toy.make_model()` 都在交出模型前调用 `.eval()`。实现 `greedy_generate` 时，可以让模型加载方负责设置 eval，生成入口用 `@torch.inference_mode()` 或对应的 `with` 作用域覆盖整个 prefill/decode 循环，包括 forward 里的 K/V 写入。
+
 ## 当前实验记录
 
-环境为 Mac arm64 CPU、Python 3.12.4、PyTorch 2.15.0。Lab 01 与 Lab 02 合跑为 `7 passed, 5 failed, 1 skipped`。其中 Lab 01 为 `6 passed`，Lab 02 的绝对位置掩码测试已通过，剩余 5 个 toy 用例触发缓存或生成函数的 `NotImplementedError`。真权重用例因未设置 `QWEN_MODEL_DIR` 跳过。Lab 06 的按行 RoPE 测试额外跑过，`1 passed`。
+环境为 Mac arm64 CPU、Python 3.12.4、PyTorch 2.15.0。复查空读和构造器的零值校验后，连续缓存与绝对位置掩码用例通过，两组分段 logits 对拍失败，合计 `2 passed, 2 failed, 3 deselected`。此前 Lab 01 的 6 项用例均通过，贪心生成尚待实现，真权重用例因未设置 `QWEN_MODEL_DIR` 跳过。Lab 06 的按行 RoPE 测试此前单独验证过，`1 passed`。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider \
