@@ -427,3 +427,71 @@ scores = scores.masked_fill(~allowed, float("-inf"))
 ```
 
 误传 `allowed` 会反过来屏蔽历史、保留未来；当某一行全部被填成 `-inf` 时，softmax 会产生 `NaN`。此外，`query_positions` 和 `kv_positions` 应创建在 `q.device` 上，以支持 CUDA。
+
+## 8. TinyQwen3 的权重映射与 Forward
+
+### 投影形状
+
+设模型宽度为 `D_model`、Q head 数为 `Hq`、KV head 数为 `Hkv`、head dim 为 `D`：
+
+```text
+embedding:       [V,D_model]
+q_proj.weight:   [Hq*D,D_model]
+k_proj.weight:   [Hkv*D,D_model]
+v_proj.weight:   [Hkv*D,D_model]
+o_proj.weight:   [D_model,Hq*D]
+gate/up.weight:  [I,D_model]
+down.weight:     [D_model,I]
+q/k_norm.weight: [D]
+```
+
+Q 内部宽度 `Hq*D` 可以大于 `D_model`，不能假设二者相等。PyTorch 与 HF 的 Linear 权重都是 `[out_features,in_features]`，`F.linear(x,w)` 内部使用 `w.T`，加载时不要再手动转置。
+
+### 每层的 Pre-Norm 与残差
+
+```text
+h
+├────────────────────────────── residual ─────────────────────────────┐
+└→ input_layernorm → QKV → QK Norm → RoPE → GQA → o_proj → attention_out ┤
+                                                                       ↓
+                                                              h = h + attention_out
+
+h
+├──────────────────── residual ────────────────────┐
+└→ post_attention_layernorm → SwiGLU MLP → mlp_out  ┤
+                                                    ↓
+                                           h = h + mlp_out
+```
+
+残差跨越整个 attention 或 MLP 子层，RMSNorm 只作用于子层输入。Qwen3 的 q_norm/k_norm 在拆分 heads 后作用于最后的 head-dim 维，并在 RoPE 之前执行；V 不做 QK Norm 或 RoPE。
+
+### Q/K/V 与 head 布局转换
+
+```text
+线性投影: [B,T,H*D]
+reshape:  [B,T,H,D]
+transpose:[B,H,T,D]       ← apply_rope / causal_gqa 使用
+
+attention 输出:
+[B,H,T,D] → transpose → [B,T,H,D] → reshape → [B,T,H*D]
+```
+
+transpose 后内存可能不连续，合并 heads 时使用 `reshape` 比依赖 `view` 更稳妥。
+
+### SwiGLU
+
+\[
+MLP(x)=W_{down}(SiLU(W_{gate}x)\odot W_{up}x)
+\]
+
+gate 和 up 接收同一个归一化输入，逐元素相乘后由 down 投影回模型宽度。
+
+### Embedding、最终 Norm 与 Logits
+
+所有 Decoder Layer 完成后，还要执行 `model.norm`，再投影到 vocab 维：
+
+```text
+input_ids [B,T] → hidden [B,T,D_model] → logits [B,T,V]
+```
+
+logits 是未经过 softmax 的原始分数。若 `tie_word_embeddings=True`，LM head 复用 embedding 权重，权重文件可能不含 `lm_head.weight`。使用 `nn.ModuleList` 注册各层，保证 `.parameters()` 和 `.to(device,dtype)` 能遍历它们。

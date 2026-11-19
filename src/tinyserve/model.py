@@ -68,6 +68,7 @@ def apply_rope(x: Tensor, positions: Tensor, theta: float) -> Tensor:
 def causal_gqa(q: Tensor, k: Tensor, v: Tensor, *, query_start: int = 0) -> Tensor:
     """Lab 01/02. x is [B, H, T, D]. K/V begin at position zero."""
     original_dtype = q.dtype
+    on_device = q.device
     group_num = q.shape[1] // k.shape[1]
 
     d = q.shape[-1]
@@ -88,8 +89,8 @@ def causal_gqa(q: Tensor, k: Tensor, v: Tensor, *, query_start: int = 0) -> Tens
     # [B, H_q, T_q, T_kv]
     scaled_dot = torch.matmul(q_fp32, k_fp32.transpose(-1, -2)) / math.sqrt(d)
 
-    query_positions = query_start + torch.arange(t_q)
-    kv_positions = torch.arange(t_kv)
+    query_positions = query_start + torch.arange(t_q, device=on_device)
+    kv_positions = torch.arange(t_kv, device=on_device)
     # [T_q, T_kv]
     allowed = query_positions.unsqueeze(1) >= kv_positions.unsqueeze(0)
 
