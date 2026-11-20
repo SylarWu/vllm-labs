@@ -6,9 +6,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
-
 from tinyserve.cache import KVStore
+from torch import Tensor, nn
 
 
 @dataclass(frozen=True)
@@ -334,6 +333,9 @@ class TinyQwen3(nn.Module):
             self, input_ids: Tensor, cache: KVStore | None = None, *, start_pos: int = 0
     ) -> Tensor:
         """Lab 01/02. [B, T] IDs -> [B, T, V] logits. With cache, B=1."""
+        if cache is None and start_pos != 0:
+            raise ValueError(f"when kv cache is None, start_pos should be 0, but got {start_pos}")
+
         x = self._select_token(input_ids)
 
         for decoder in self.decoders:

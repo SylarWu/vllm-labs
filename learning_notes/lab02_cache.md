@@ -198,6 +198,20 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider \
   tests/test_lab01_model.py tests/test_lab02_cache.py
 ```
 
+### 同步后的本机复验
+
+本机在 `f5473d5` 上重跑上述命令，结果为 `12 passed, 1 skipped`，跳过的是未配置 `QWEN_MODEL_DIR` 的可选真权重测试。
+
+- `(1, 2, 3)` 分段的两层都观测到 `(query_start, Tq, Tk, Tv)` 依次为 `(0,1,1,1)`、`(1,2,3,3)`、`(3,3,6,6)`。分段 logits 的最大绝对误差约为 `2.38e-7`，最终游标为 `[6, 6]`。
+- 用 4 个 prompt token 生成 7 个新 token，有缓存与无缓存的输出 ID 相同。无缓存每轮只把最新 token 加到已有前缀，输入长度为 `4, 5, 6, 7, 8, 9, 10`。有缓存只在 prefill 输入 4 个 token，此后每轮输入 1 个，位置为 `0, 4, 5, 6, 7, 8, 9`，容量恰好为 `10` 也能跑完。最终的两层游标为 `[10, 10]`，最后选出的 token 还未送进模型。两条路径的所有 forward 都在 `inference_mode` 中执行。
+
+本轮审查还复现了两个调用边界。它们可以在需要扩大接口支持时处理。
+
+- **位置参数的约定。** `start_pos` 是本轮第一个输入 token 的位置。无缓存生成每轮都重算完整前缀，Q/K/V 都覆盖 `0..T-1`，所以现有生成器始终传 `start_pos=0` 是正确的，只取末尾 logits 不影响这个起点。审查中的反例是绕过生成器，直接用 `cache=None` 和非零 `start_pos` 调模型。此时 `causal_gqa` 给 Q 加上偏移，给 K/V 仍从 0 编号，导致本段 query 可能看到后面的 token。实测 `start_pos=1` 时，在 `[10]` 后追加 `8` 让第一个位置的 logits 最大绝对差达到 `1.05`，`start_pos=0` 时差异约为 `1.49e-7`。如果要在公开接口限制这种调用，可以明确无缓存整段路径要求 `start_pos=0`。
+- **入口校验。** 带 cache 的 `B=2` 会在 `squeeze(0)` 之后的 `permute` 报形状错误，空 prompt 且生成预算为正时会在 attention 的 `reshape` 报错。可以在入口明确报出 `B=1` 或 prompt 非空的前置条件。保留零预算直接返回的行为。无缓存的整段 forward 实测可以处理 `B=2`。
+
+如果将上述位置约定作为 `TinyQwen3.forward` 的强校验，可以在 embedding 前检查 `cache is None and start_pos != 0`，并抛出 `ValueError`。默认参数已经处理了调用者省略 `start_pos` 的情况。遇到显式传入的非法偏移，报错能暴露调用端可能误传了 decode chunk。静默改成 `0` 会继续计算这段缺少历史的输入，返回的 logits 形状依然正常，调用方很难察觉前缀丢失。
+
 用 `tests.toy.make_model()` 对 prompt `[10, 8, 1, 6, 42]` 做三轮完整前缀重算，可观察到 logits 形状依次为 `[1, 5, 43]`、`[1, 6, 43]`、`[1, 7, 43]`，每次贪心采样都选出 ID `42`。相同的 ID 在不同位置仍是序列里的不同 token，分别按自己的绝对位置处理。下面的脚本可复现这条无缓存基线。
 
 ```python
