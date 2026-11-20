@@ -62,27 +62,66 @@ class BlockTable:
     def __init__(self, pool: BlockPool, block_size: int) -> None:
         self.pool = pool
         self.block_size = block_size
-        raise NotImplementedError("Lab 03: one request's logical blocks")
+
+        # logical allocated block id -> physical poll allocated block id
+        self.allocated = []
+        self.slot_counts = []
 
     @property
     def block_ids(self) -> tuple[int, ...]:
-        raise NotImplementedError("Lab 03: physical blocks in logical order")
+        return (*self.allocated,)
 
     @property
     def reserved_tokens(self) -> int:
-        raise NotImplementedError("Lab 03: logical reservation")
+        if len(self.allocated) == 0:
+            return 0
+        return (len(self.allocated) - 1) * self.block_size + self.slot_counts[-1]
 
     def reserve(self, total_tokens: int) -> None:
         """Grow to cover total_tokens. Existing mappings are stable."""
-        raise NotImplementedError("Lab 03: grow a block table atomically")
+        if total_tokens <= 0:
+            raise ValueError("reserve total tokens cannot less or equal zero")
+        if total_tokens <= self.reserved_tokens:
+            return
+
+        total_block_counts = (total_tokens - 1) // self.block_size + 1
+        already_allocated_block_count = len(self.allocated)
+
+        if total_block_counts > already_allocated_block_count:
+            new_allocated_block_ids = self.pool.allocate(total_block_counts - already_allocated_block_count)
+
+            self.allocated.extend(new_allocated_block_ids)
+            if len(self.slot_counts) > 0:
+                self.slot_counts[-1] = self.block_size
+            self.slot_counts.extend(
+                [self.block_size for _ in range(total_block_counts - already_allocated_block_count)]
+            )
+
+        self.slot_counts[-1] = total_tokens - (self.block_size * (len(self.allocated) - 1))
 
     def slots(self, start: int, count: int) -> tuple[int, ...]:
         """Resolve logical positions to flat physical slots; out of range raises IndexError."""
-        raise NotImplementedError("Lab 03: translate positions to slots")
+        if start < 0 or start + count > self.reserved_tokens:
+            raise IndexError(f"Slot {start} is out of range")
+        if count < 0:
+            raise ValueError(f"Count {count} is negative")
+
+        ret = []
+
+        for idx in range(start, start + count):
+            block_id = self.allocated[idx // self.block_size]
+            offset = idx % self.block_size
+            ret.append(block_id * self.block_size + offset)
+
+        return (*ret,)
 
     def release(self) -> None:
         """Return all owned blocks. Repeated release is safe."""
-        raise NotImplementedError("Lab 03: release a request's block table")
+        if self.reserved_tokens == 0:
+            return
+        self.pool.free(self.allocated)
+        self.allocated = []
+        self.slot_counts = []
 
 
 class PagedStorage:
