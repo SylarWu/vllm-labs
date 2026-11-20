@@ -15,20 +15,47 @@ class CapacityError(RuntimeError):
 class BlockPool:
     def __init__(self, capacity: int) -> None:
         """Lab 03. Physical block IDs are in [0, capacity)."""
+        if capacity <= 0:
+            raise CapacityError(f"Block pool cannot satisfy a {capacity} capacity reservation")
         self.capacity = capacity
-        raise NotImplementedError("Lab 03: free and allocated blocks")
+
+        self.free_ids = [i for i in range(capacity)]
+        self.allocated = [False for _ in range(capacity)]
 
     @property
     def free_count(self) -> int:
-        raise NotImplementedError("Lab 03: count free blocks")
+        return len(self.free_ids)
 
     def allocate(self, count: int) -> list[int]:
         """All-or-nothing. Raise CapacityError if available space is too small."""
-        raise NotImplementedError("Lab 03: allocate blocks")
+        if count < 0 or count > self.free_count:
+            raise CapacityError(f"Current BlockPool free block counts is {self.free_count}, can't allocate {count}")
+        if count == 0:
+            return []
+
+        ret = [self.free_ids.pop() for _ in range(count)]
+
+        for i in ret:
+            self.allocated[i] = True
+
+        return ret
 
     def free(self, block_ids: Iterable[int]) -> None:
         """All-or-nothing. Raise ValueError for duplicates or unowned blocks."""
-        raise NotImplementedError("Lab 03: return blocks")
+        block_id_set = set()
+        for block_id in block_ids:
+            if block_id in block_id_set:
+                raise ValueError(f"Duplicate Block ID: {block_id}")
+            if not 0 <= block_id < self.capacity:
+                raise ValueError(f"Block ID {block_id} is out of range")
+            if not self.allocated[block_id]:
+                raise ValueError(f"Block ID {block_id} is not owned")
+
+            block_id_set.add(block_id)
+
+        for block_id in block_id_set:
+            self.allocated[block_id] = False
+            self.free_ids.append(block_id)
 
 
 class BlockTable:
@@ -60,15 +87,15 @@ class BlockTable:
 
 class PagedStorage:
     def __init__(
-        self,
-        *,
-        num_layers: int,
-        num_blocks: int,
-        block_size: int,
-        kv_heads: int,
-        head_dim: int,
-        device: str | torch.device = "cpu",
-        dtype: torch.dtype | None = None,
+            self,
+            *,
+            num_layers: int,
+            num_blocks: int,
+            block_size: int,
+            kv_heads: int,
+            head_dim: int,
+            device: str | torch.device = "cpu",
+            dtype: torch.dtype | None = None,
     ) -> None:
         """Lab 05. Allocate two physical tensors [L, blocks, block_size, Hkv, D]."""
         raise NotImplementedError("Lab 05: allocate the shared K/V tensors")
