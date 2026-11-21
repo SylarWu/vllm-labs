@@ -99,7 +99,7 @@ class Engine:
 
         self.scheduler.submit(request)
 
-    def _prepare_kv_cache(self, request: Request):
+    def _prepare_kv_cache(self, request: Request) -> None:
         request_id = request.request_id
 
         if request_id not in self.kv_cache.keys():
