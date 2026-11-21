@@ -11,7 +11,7 @@
 | 03 | Block pool 与 block table | 已完成，`3 passed`，整页释放和保留范围边界已复验 | [Lab 03](learning_notes/lab03_paging.md) |
 | 04 | 迭代级调度 | 已完成，`5 passed`；Lab 01～04 回归 `20 passed, 1 skipped`，准入、取消和退休边界已复验 | [Lab 04](learning_notes/lab04_scheduler.md) |
 | 05 | 分页 KV 与端到端 Engine | 已完成，`3 passed`；Lab 01～05 回归 `23 passed, 1 skipped`，PagedKV 跨 tick 生命周期已复验 | [Lab 05](learning_notes/lab05_engine.md) |
-| 06 | 真 batch decode 与 chunked prefill | 未开始；RoPE 扩展已提前完成 | 待创建 |
+| 06 | 真 batch decode 与 chunked prefill | 学习中；Scheduler 与 budget 边界复验通过，下一步 `decode_batch` | [Lab 06](learning_notes/lab06_batch.md) |
 | 07 | FastAPI、SSE 与取消 | 未开始 | 待创建 |
 | 08 | 指标、压测与官方 vLLM 对照 | 未开始 | 待创建 |
 
