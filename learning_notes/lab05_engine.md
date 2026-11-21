@@ -1,6 +1,6 @@
 # Lab 05 · 分页 KV 与端到端 Engine
 
-**状态：学习中。`PagedStorage/PagedKV` 定向验收已通过（`1 passed, 2 deselected`）；Engine 尚未实现。**
+**状态：已完成。Lab 05 验收 `3 passed`；Lab 01～05 回归 `23 passed, 1 skipped`。**
 
 ## 本 lab 要打通的路径
 
@@ -199,6 +199,57 @@ Scheduler 的 `try_admit` 在本实验中不仅回答“是否放得下”，还
 `has_work` 必须同时覆盖 active 和 waiting。只要还有等待请求，外部驱动循环就不能提前退出。`free_blocks` 直接反映共享池的当前空闲块数。
 
 执行 forward 和采样可使用 `torch.inference_mode()`，避免为推理建立 autograd 图。Lab 05 逐 Step 运行；即使本轮返回多个事件，也只是连续执行了多个单请求 forward。
+
+## Engine 第一次代码复盘：临时视图丢失写入进度
+
+定向结果：
+
+```text
+small_pool：1 passed, 2 deselected
+serving：1 failed, 2 deselected
+```
+
+失败发生在 A 的第一次 decode：Scheduler 正确给出了 `start_pos=4`，但传入 forward 的 PagedKV 中 layer 0 的写入长度仍为 0，于是 append 校验拒绝写入。
+
+根因不是 `written_length` 没有执行更新，而是 Engine 只持久化了 BlockTable，并在每次 forward、甚至打印调试信息时重新调用 `storage.view(table)`。该方法每次执行 `PagedKV(...)`，返回一个新对象。每个新对象都有自己的 `written_length=[0,0]`，即使它们共享同一个 storage 和 table，也不会共享这份 Python 列表状态。
+
+```text
+准入：创建 BlockTable，预留 A 的页
+Prefill forward：创建 PagedKV #1 → 写入长度推进到 [4,4] → 对象随后无人持有
+打印：创建 PagedKV #2 → 观察到 [0,0]
+Decode forward：创建 PagedKV #3 → start_pos=4，但 layer 0 长度为 0 → 报错
+```
+
+BlockTable 只保存地址和预留范围，不保存各层写入进度。因此，**同一活跃请求的 PagedKV 也必须与 BlockTable 一样具有跨 tick 的稳定身份**。在准入时创建一次，后续 prefill/decode 都取得同一实例，退休时同时清理请求资源。
+
+`small_pool` 没捕获这个问题，是因为 A 在 prefill 后立即取消，B 在首次 prefill 发出一个 token 后即达到长度上限，二者都没有进行第二次 forward。测试通过只能证明覆盖到的行为正确，不能证明未覆盖的 decode 连续性正确。
+
+调试此类问题可打印视图对象的 `id` 以及每轮写入前后的长度。如果每轮对象 ID 改变，就应先检查对象生命周期，而不是怀疑列表的加法。
+
+另一个独立问题是 `_prepare_kv_cache` 标注返回 `BlockTable`，实际没有 return。若调用方只依赖副作用，暂时不触发失败，但类型标注和实现应保持一致。
+
+Engine 其余已检查部分符合当前约定：从模型配置建立 storage，提交时拒绝永久超限请求，准入时一次性预留，退休回调释放 table，`has_work` 同时覆盖等待和活跃请求，forward/采样处于 inference mode。
+
+## Lab 05 完成总结
+
+最终实现将 `request_id → PagedKV` 保存在 Engine 中。准入时创建一次视图并预留页，所有 Step 直接复用同一个实例；退休时弹出该实例并通过 `cache.table.release()` 归还页。这样三种状态的生命周期已经对齐：
+
+- 共享 PagedStorage 由 Engine 长期持有。
+- 请求的 BlockTable 由稳定的 PagedKV 持有。
+- 请求的按层 written length 随 PagedKV 跨 tick 保留，退休时一起清理。
+
+最终验收：
+
+```text
+tests/test_lab05_engine.py：3 passed
+Lab 01～05 回归：23 passed, 1 skipped
+```
+
+覆盖了非连续页 scatter/gather、请求与层隔离、混合请求输出与串行完整重算一致、小页池等待、等待/活跃请求取消、正常完成后的页回收。跳过项仍是可选真实模型测试，不影响 CPU toy 验收。
+
+本 lab 最核心的心得是：**共享底层数据不代表可以丢弃有状态视图。** BlockTable 保存地址，PagedStorage 保存数值，PagedKV 保存逐层写入进度；只有把三者的所有权和生命周期分清，append 校验才有意义。
+
+当前逐 Step forward、gather 成连续历史以及准入时最大长度预留，都是 Lab 05 有意保留的简化。Lab 06 将在此基础上合并 decode forward，并引入 chunked prefill，不需要反过来推翻本 lab 的分页存储抽象。
 
 ## 建议实践顺序与验收观察
 
