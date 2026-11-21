@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import torch
-    from torch import Tensor
+import torch
+from torch import Tensor
 
 
 class CapacityError(RuntimeError):
@@ -137,19 +135,115 @@ class PagedStorage:
             dtype: torch.dtype | None = None,
     ) -> None:
         """Lab 05. Allocate two physical tensors [L, blocks, block_size, Hkv, D]."""
-        raise NotImplementedError("Lab 05: allocate the shared K/V tensors")
+        if num_layers < 1:
+            raise ValueError(f"PagedStorage: Number of layers: {num_layers} is invalid")
+        self.num_layers = num_layers
+        if num_blocks < 1:
+            raise ValueError(f"PagedStorage: Number of blocks: {num_blocks} is invalid")
+        self.num_blocks = num_blocks
+        if block_size < 1:
+            raise ValueError(f"PagedStorage: Block size: {block_size} is invalid")
+        self.block_size = block_size
+        if kv_heads < 1:
+            raise ValueError(f"PagedStorage: KV heads: {kv_heads} is invalid")
+        self.kv_heads = kv_heads
+        if head_dim < 1:
+            raise ValueError(f"PagedStorage: Head dim: {head_dim} is invalid")
+        self.head_dim = head_dim
+
+        self.device = device
+        self.dtype = dtype
+
+        self.k_cache = torch.empty(
+            (num_layers, num_blocks * block_size, kv_heads, head_dim),
+            device=device,
+            dtype=dtype,
+            requires_grad=False,
+        )
+        self.v_cache = torch.empty(
+            (num_layers, num_blocks * block_size, kv_heads, head_dim),
+            device=device,
+            dtype=dtype,
+            requires_grad=False,
+        )
 
     def view(self, table: BlockTable) -> PagedKV:
         """Return a request view sharing physical storage; default dtype is FP32."""
-        raise NotImplementedError("Lab 05: bind a block table to the tensor pool")
+        return PagedKV(storage=self, table=table)
 
 
 class PagedKV:
     def __init__(self, storage: PagedStorage, table: BlockTable) -> None:
-        raise NotImplementedError("Lab 05: per-request state over shared storage")
+        self.storage = storage
+        self.table = table
+
+        self.written_length = [0 for _ in range(storage.num_layers)]
+
+    def _check_layer(self, layer: int) -> None:
+        if layer < 0 or layer >= self.storage.num_layers:
+            raise ValueError(f"PagedKV: Layer {layer} is invalid")
+
+    def _write(self, layer: int, start_pos: int, key: Tensor, value: Tensor) -> None:
+        token_length, num_heads, head_dim = key.shape
+
+        slot_indexes = self.table.slots(start_pos, token_length)
+
+        for idx, slot_idx in enumerate(slot_indexes):
+            self.storage.k_cache[layer][slot_idx].copy_(key[idx])
+            self.storage.v_cache[layer][slot_idx].copy_(value[idx])
+        self.written_length[layer] = self.written_length[layer] + token_length
 
     def write(self, layer: int, start_pos: int, key: Tensor, value: Tensor) -> None:
-        raise NotImplementedError("Lab 05: scatter K/V into physical slots")
+        self._check_layer(layer)
+        if start_pos < 0 or start_pos > self.table.reserved_tokens or start_pos != self.written_length[layer]:
+            raise ValueError(f"PagedKV: Start position {start_pos} is invalid")
+        if key is None or value is None:
+            raise ValueError(f"PagedKV: Key or Value is empty")
+        if len(key.shape) != 3 or len(value.shape) != 3:
+            raise ValueError(
+                f"PagedKV: Key or Value Shape is invalid. Key Shape: {key.shape}, Value Shape: {value.shape}"
+            )
+        token_length, num_heads, head_dim = key.shape
+        if token_length != value.shape[0] or num_heads != value.shape[1] or head_dim != value.shape[2]:
+            raise ValueError(
+                f"PagedKV: Key Value Token Length is not aligned. Key Shape: {key.shape}, Value Shape: {value.shape}"
+            )
+        if token_length <= 0:
+            raise ValueError(
+                f"PagedKV: Not allow empty write. Key Shape: {key.shape}, Value Shape: {value.shape}"
+            )
+        if num_heads != self.storage.kv_heads:
+            raise ValueError(
+                f"PagedKV: Key-Value number of heads is mismatch. KV Shape: {key.shape}, Cache number of heads: {self.storage.kv_heads}"
+            )
+        if head_dim != self.storage.head_dim:
+            raise ValueError(
+                f"PagedKV: Key-Value head dim is mismatch. KV Shape: {key.shape}, Cache head dim: {self.storage.head_dim}"
+            )
+
+        self._write(layer, start_pos, key, value)
+
+    def _read(self, layer: int, length: int) -> tuple[Tensor, Tensor]:
+        slot_indexes = self.table.slots(0, length)
+
+        k = torch.empty(
+            (length, self.storage.kv_heads, self.storage.head_dim),
+            device=self.storage.device,
+            dtype=self.storage.dtype,
+        )
+        v = torch.empty(
+            (length, self.storage.kv_heads, self.storage.head_dim),
+            device=self.storage.device,
+            dtype=self.storage.dtype,
+        )
+        for idx, slot_idx in enumerate(slot_indexes):
+            k[idx].copy_(self.storage.k_cache[layer][slot_idx])
+            v[idx].copy_(self.storage.v_cache[layer][slot_idx])
+        return k, v
 
     def read(self, layer: int, length: int) -> tuple[Tensor, Tensor]:
-        raise NotImplementedError("Lab 05: gather logically contiguous K/V")
+        self._check_layer(layer)
+        if length < 1 or length > self.written_length[layer]:
+            raise ValueError(f"PagedKV: Length is invalid")
+
+        return self._read(layer, length)

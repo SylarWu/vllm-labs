@@ -10,7 +10,7 @@
 | 02 | 连续 KV cache、prefill/decode 与贪心生成 | CPU toy 验收完成，Lab 01+02 合计 `12 passed`；真权重对拍待选做 | [Lab 02](learning_notes/lab02_cache.md) |
 | 03 | Block pool 与 block table | 已完成，`3 passed`，整页释放和保留范围边界已复验 | [Lab 03](learning_notes/lab03_paging.md) |
 | 04 | 迭代级调度 | 已完成，`5 passed`；Lab 01～04 回归 `20 passed, 1 skipped`，准入、取消和退休边界已复验 | [Lab 04](learning_notes/lab04_scheduler.md) |
-| 05 | 分页 KV 与端到端 Engine | 未开始 | 待创建 |
+| 05 | 分页 KV 与端到端 Engine | 学习中；分页存储定向验收通过（`1 passed, 2 deselected`），进入 Engine | [Lab 05](learning_notes/lab05_engine.md) |
 | 06 | 真 batch decode 与 chunked prefill | 未开始；RoPE 扩展已提前完成 | 待创建 |
 | 07 | FastAPI、SSE 与取消 | 未开始 | 待创建 |
 | 08 | 指标、压测与官方 vLLM 对照 | 未开始 | 待创建 |
