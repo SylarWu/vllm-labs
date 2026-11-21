@@ -196,7 +196,9 @@ class PagedKV:
     def write(self, layer: int, start_pos: int, key: Tensor, value: Tensor) -> None:
         self._check_layer(layer)
         if start_pos < 0 or start_pos > self.table.reserved_tokens or start_pos != self.written_length[layer]:
-            raise ValueError(f"PagedKV: Start position {start_pos} is invalid")
+            raise ValueError(
+                f"PagedKV: Start position {start_pos} is invalid"
+            )
         if key is None or value is None:
             raise ValueError(f"PagedKV: Key or Value is empty")
         if len(key.shape) != 3 or len(value.shape) != 3:

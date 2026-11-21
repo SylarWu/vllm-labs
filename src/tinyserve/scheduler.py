@@ -144,8 +144,8 @@ class Scheduler:
         status.processed_tokens = status.processed_tokens + len(step.input_ids)
         status.generated_tokens = status.generated_tokens + (1 if sampled_token is not None else 0)
         status.last_token = sampled_token
-        # judge finish condition
 
+        # judge finish condition
         if sampled_token == request.eos_token_id:
             self._retire(req_id)
             return TokenEvent(request_id=req_id, token_id=sampled_token, finish_reason="stop")
