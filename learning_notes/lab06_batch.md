@@ -191,6 +191,73 @@ batched decode 增加了逐行长度和 padding 维度的语义。可以扩展�
 - 为减少重复，可在 `TinyQwen3Attention` / `TinyQwen3Decoder` 增加 batched decode 辅助路径。
 - 现有单请求 `forward` 的行为应保持不变，Lab 01～05 回归是约束。
 
+## decode_batch 的两层等价性验收
+
+批量 decode 不仅要让本步输出正确，还要保证它写下的 KV 能支撑后续生成。因此需要连续检查两个不变量：
+
+1. **本步 logits 等价**：不同历史长度的请求组成 batch 后，每行最后的 logits 等于该请求完整历史加当前 token 的一次性重算结果。这能发现 RoPE 位置、历史 gather、padding mask 和行顺序错误。
+2. **下一步 KV 等价**：batch decode 后，再分别输入一个新 token 做普通 decode，其结果仍等于完整重算。这能进一步发现 cache 写入位置、写入内容和层索引错误。
+
+只通过第一项并不充分：如果 attention 错用了临时拼接的当前 K/V，本步输出可能看似正确，但 cache 中并未留下正确历史，下一步才会暴露。
+
+排错时应先固定单行、逐层检查，再扩展到不同长度的多行。若 batch 与逐条结果不一致，依次定位“投影前是否一致 → RoPE 后是否一致 → 写入 cache 后是否一致 → gather/pad 后是否一致 → mask 后 scores 是否一致”，不要一开始只观察最终 token；argmax 相同也可能掩盖 logits 的数值错误。
+
+## decode 与 prefill chunk 的统一长度语义
+
+`decode_batch` 只接收 decode 行，每行恰好输入一个 token，因此输入恒为 `[B,1]`。当 Scheduler 在一个 tick 同时返回 decode 和 prefill chunk 时，本 lab 的 Engine 将它们拆开执行：
+
+- 所有 decode 行合并，调用一次 `decode_batch`。
+- 每个 prefill chunk 仍分别调用普通 `forward`，使用自己的连续 KV 视图和 `start_pos`。
+- 不为凑成 batch 把不同长度的 prompt chunk 填进 `decode_batch`。
+
+这只是教学版的实现边界，并不表示 prefill 和 decode 在原理上不能进入同一个 batch。更一般的 `forward_batch` 可以让每行有自己的输入长度 `T_b`：decode 行满足 `T_b=1`，prefill chunk 行满足 `T_b=C_b`。但需要同时解决以下问题：
+
+1. 输入按行变长，不能直接沿用 `[B,1]` 接口。
+2. 每行有独立 RoPE positions，且只把真实 token 的 K/V 写入 cache。
+3. attention 同时需要因果约束、历史 K/V padding mask 和输入 query padding mask。
+4. 中间 chunk 不采样，最后 chunk 在自己最后一个真实位置采样，decode 在其唯一位置采样。
+
+一种实现是把输入右填充为 `[B,Tmax]`。对第 b 行、chunk 内第 i 个 query 和历史第 j 个 key，允许可见的条件为：
+
+```text
+i < T_b                    # query 是真实输入
+j < p_b + T_b              # key 是写入后的真实历史
+j <= p_b + i               # 不能看未来
+```
+
+这里不能统一取 `logits[:,-1]`：右填充后，最后一个位置可能是无效 query；中间 prefill chunk 甚至没有输出事件。若把无效 query 的全部 scores 都屏蔽，softmax 还可能出现全 `-inf` 行，因此需要避免计算或妥善处理这些占位行，并最终丢弃其结果。
+
+另一种更接近高性能实现的方式是把所有真实 token 展平成 `[sum(T_b),D]`，配合每个请求的起止偏移和变长 attention，不做矩形 padding。它能减少无效计算，但元数据和 kernel 接口明显更复杂。
+
+本 lab 先采用“decode 合批、prefill 分开”的方案，是为了独立验证 KV 与 mask 正确性；掌握后可以再扩展为统一混合 batch。
+
+更一般的 cache 长度公式不局限于 decode。设本次输入长度是 `T`，起始绝对位置是 `p`：
+
+```text
+本次写入位置：[p, p + T)
+写入 K/V：[T,Hkv,D]
+写入后长度：S = p + T
+本层读取范围：[0, p + T)
+```
+
+decode 只是 `T=1` 的特例，所以 `S=p+1`。prefill chunk 的长度为 `C` 时，一次写入整个 `[C,Hkv,D]`，随后读取长度 `p+C`。例如 prompt 长 7，按 3、3、1 分块：
+
+| Chunk | 输入位置 | 本次写入数 | 写后/读取长度 |
+| --- | --- | --- | --- |
+| 1 | `[0,3)` | 3 | 3 |
+| 2 | `[3,6)` | 3 | 6 |
+| 3 | `[6,7)` | 1 | 7 |
+
+中间 chunk 虽然不采样，仍要正常经过每层并写入 K/V；后续层和后续 chunk 都依赖这些结果。
+
+prefill chunk 的 attention 还需要因果约束。chunk 内第 `i` 个 query 的绝对位置是 `p+i`，只能读取满足 `j<=p+i` 的 key：它可以看旧 cache 和本 chunk 中不晚于自己的 token，不能看本 chunk 中更晚的 token。最后一个 chunk 与中间 chunk 的计算规则相同，区别只是前者会使用末尾 logits 采样，后者不采样。
+
+## padding 对齐的是历史 K/V，不是 decode 输入
+
+decode 的输入本来就统一为 `[B,1]`，不需要给 token IDs 补 padding。需要补齐的是从各请求 cache 读出的历史 K/V，因为它们的 `S_b=p_b+1` 不同，而 batched attention 需要统一的 `[B,Hkv,Smax,D]`。
+
+因此 mask 表达的是“这个 key/value 槽位是否属于该行的真实历史”，不是“这个输入 token 是否有效”。无效槽位必须在 attention scores 进入 softmax 前被屏蔽；仅仅把输入或 V 填零并不能替代 mask。
+
 ## Engine 如何只调用一次 batched decode
 
 `scheduler.plan()` 可能同时返回 decode 和 prefill。Engine 应先分类：
@@ -325,6 +392,72 @@ long 前两次 complete 都只推进 processed；最后一次发出 token 并因
 ```
 
 [模型入口](../src/tinyserve/model.py)、[调度器入口](../src/tinyserve/scheduler.py)、[Engine 入口](../src/tinyserve/engine.py)、[验收测试](../tests/test_lab06_batch.py)
+
+## decode_batch 第一次代码复盘
+
+### 当前测试阻塞点：K/V 聚合张量形状错误
+
+`adjustable_forward` 将 `final_k/final_v` 创建为 `[B,Smax,hidden_size]`，但 `KVStore.read` 返回 `[S_b,Hkv,D]`，而 `general_causal_gqa` 的 Q/K/V 布局约定是 `[B,H,S,D]`。这里同时缺少 head 轴，并误用了 `hidden_size`；K/V 的最后一维应是 `D`，head 轴长度应是 `Hkv`，不是 `Hq`，也不一定满足 `hidden_size=Hkv*D`。
+
+实测 `test_real_batch_logits_match_different_length_cached_and_full_rows` 在首次给 `final_k` 赋值时失败：
+
+```text
+RuntimeError: expand(torch.FloatTensor{[3,2,8]}, size=[3,24]):
+the number of sizes provided (2) must be greater or equal to the number of dimensions in the tensor (3)
+```
+
+其中 `[3,2,8]` 正是 `[S_b,Hkv,D]`。修正方向是统一 gather 后的布局与 attention 的 `[B,Hkv,Smax,D]` 约定，并在从 cache 的 `[S_b,Hkv,D]` 布局转换时显式调整轴顺序。
+
+### 混合 batch 不能只把 actual_length 传给 mask
+
+当前 KV 写入使用 `k[b].permute(1,0,2)`，包含该行全部 `token_length=Tmax` 个位置，没有按 `actual_length[b]` 截断。对纯 decode，因为 `Tmax=T_b=1`，暂时不会暴露；对混合 decode/prefill，右侧 padding 会被当作真实 token 写入，导致写后游标和后续历史错误。只写入 `[0,T_b)`，读取长度仍应为 `p_b+T_b`。
+
+公共 `TinyQwen3.decode_batch` 目前还把 `actual_length` 固定为全 1，所以它仍是纯 decode 接口。要支持混合 batch，需要从上层传入每行真实长度，并明确输入 padding、采样位置和中间 chunk 不发事件的契约。
+
+### general_causal_gqa 的位置边界
+
+`end_position=p+T` 是排他的写入后长度，最后一个真实 query 的绝对位置应为 `p+T-1`。当前 `prepare_positions <= end_positions` 多接受了一个位置，把越界位置 clamp 到 `end_positions` 也不是最后一个真实位置。对真实 query 尚未造成错误，但 padding query 的位置语义不正确。
+
+更清晰的 mask 应分别表达：
+
+```text
+valid_query[b,i] = i < T_b
+valid_key[b,j]   = j < p_b + T_b
+causal[b,i,j]    = j <= p_b + i
+```
+
+真实 query 中，正确的 causal mask 实际上已经能间接屏蔽尾部 KV padding，因为最后一个真实 query 的位置是 `S_b-1`；显式 `valid_key` 仍能让契约更清晰、更稳健。padding query 若全部被 mask，softmax 可能出现全 `-inf` 行，需要安全处理并最终丢弃其输出，不能把它采样或写入 cache。
+
+### 其他实现细节
+
+- 聚合 K/V 的 `torch.zeros` 未指定 dtype，会默认使用 FP32；真实 BF16 模型中应显式保持与输入/cache 一致的 dtype。
+- 增加混合 batch 测试时，应同时检查每行真实 logits、每层 `write_length=p_b+T_b` 和后续 decode 对拍，防止 padding 写入被最终输出掩盖。
+
+## decode_batch 第二次代码复盘
+
+### 已修正并验证
+
+- gather 后 K/V 已改为 `[B,Hkv,Smax,D]`，cache 读出的 `[S_b,Hkv,D]` 通过显式轴转换写入对应前缀。
+- 聚合张量已显式继承 K/V 的 dtype 和输入 device。
+- KV 写入已按 `actual_lengths[b]` 截断，不再写入右侧 padding。
+- attention mask 已增加 head 广播轴，`[B,Tq,Tkv] → [B,1,Tq,Tkv]` 与 scores 对齐。
+
+验证结果：
+
+```text
+Lab 06：4 passed, 2 failed；失败均为 Engine 尚未接入 batch decode / emit_token=False
+Lab 01～05：23 passed, 1 skipped
+```
+
+另用三个请求直接驱动底层混合长度路径，实际输入长度分别为 1、3、2。所有真实 query 的 logits 与逐条完整重算最大绝对误差为 `2.98e-7`，各层 cache 长度均正确推进到 `p_b+T_b`。这说明当前真实 token 的 RoPE、cache、gather、mask 和 GQA 数值路径一致。
+
+### 仍需明确的边界与优化
+
+1. 公共 `decode_batch` 应校验输入严格为 `[B,1]`。当前若误传 `[B,T>1]`，仍把每行 actual length 固定为 1，会只写一个 token 却继续计算整行，属于静默错误，最好尽早拒绝。
+2. padding query 仍被赋予 `end_position=p+T`，因而可能看到一个额外的零填充 key。当前这些输出不会作为真实结果被使用，所以混合对拍仍正确；若保留矩形 padding 实现，可将占位 query 明确视为待丢弃结果，并使用最后真实位置等安全占位，避免其语义被误用。
+3. 混合长度目前只由底层辅助函数支持，公共 `decode_batch` 仍固定 actual length 为 1。这是当前纯 decode 接口的边界，不代表已完成混合 batch 的输入、采样和事件接口。
+4. 每层都会从 Python 序列创建 positions/mask 张量并分配 gather 缓冲区，且 cache gather 仍是逐行 Python 循环。教学版先保留以便观察正确性；性能优化应在端到端验收后通过 profiling 决定。
+5. 普通 forward 与 adjustable forward 的投影、RoPE、残差流程存在重复。后续可抽取共享计算段，但应先保留独立实现对拍，避免为了去重同时改变两条路径而丢失参考基准。
 
 ## Scheduler 第一次代码复盘
 

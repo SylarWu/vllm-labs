@@ -6,8 +6,9 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from tinyserve.cache import KVStore
 from torch import Tensor, nn
+
+from tinyserve.cache import KVStore
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,53 @@ def causal_gqa(q: Tensor, k: Tensor, v: Tensor, *, query_start: int = 0) -> Tens
     return out.to(dtype=original_dtype)
 
 
+def general_causal_gqa(q: Tensor, k: Tensor, v: Tensor,
+                       *, query_start: Sequence[int], actual_lengths: Sequence[int]) -> Tensor:
+    """[B, H, T, D]."""
+    original_dtype = q.dtype
+    on_device = q.device
+    group_num = q.shape[1] // k.shape[1]
+
+    d = q.shape[-1]
+    assert d == k.shape[-1]
+    assert d == v.shape[-1]
+
+    t_q = q.shape[-2]
+    t_kv = k.shape[-2]
+    assert t_kv == v.shape[-2]
+
+    # [B, H_q, T_q, D]
+    q_fp32 = q.float()
+    # [B, H_kv, T_kv, D] -> [B, H_q, T_kv, D]
+    k_fp32 = k.float().repeat_interleave(group_num, dim=1)
+    # [B, H_kv, T_kv, D] -> [B, H_q, T_kv, D]
+    v_fp32 = v.float().repeat_interleave(group_num, dim=1)
+
+    # [B, H_q, T_q, T_kv]
+    scaled_dot = torch.matmul(q_fp32, k_fp32.transpose(-1, -2)) / math.sqrt(d)
+
+    # [B, 1]
+    start_positions = torch.tensor(query_start, device=on_device).unsqueeze(1)
+    # [B, 1] + [B, 1] -> [B, 1]
+    end_positions = (start_positions + torch.tensor(actual_lengths, device=on_device).unsqueeze(1))
+    # [B, 1] + [1, T_q] -> [B, T_q]
+    prepare_positions = (start_positions + torch.arange(t_q, device=on_device).unsqueeze(0))
+
+    query_positions = torch.where(prepare_positions < end_positions, prepare_positions, end_positions)
+
+    # [T_kv] -> [1, T_kv]
+    key_positions = torch.arange(t_kv, device=on_device).unsqueeze(0)
+    # [B, T_q, T_kv]
+    allowed = query_positions.unsqueeze(2) >= key_positions.unsqueeze(0)
+
+    scaled_dot = torch.masked_fill(scaled_dot, (~allowed).unsqueeze(1), float('-inf'))
+
+    out = torch.matmul(torch.softmax(scaled_dot, dim=-1), v_fp32)
+
+    # [B, H_q, T_q, D]
+    return out.to(dtype=original_dtype)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, normalized_shape: int, eps: float):
         super().__init__()
@@ -169,6 +217,53 @@ class TinyQwen3Attention(nn.Module):
         # [B, T_q, hidden_size]
         return self.w_out(attn)
 
+    def adjustable_forward(self, input: Tensor, caches: Sequence[KVStore],
+                           query_starts: Sequence[int], actual_lengths: Sequence[int]) -> Tensor:
+        batch_size, token_length, hidden_size = input.shape
+
+        q = self.w_q(input).reshape(batch_size, token_length, self.num_q_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.w_k(input).reshape(batch_size, token_length, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.w_v(input).reshape(batch_size, token_length, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        q = self.q_rms_norm(q)
+        k = self.k_rms_norm(k)
+
+        positions = (torch.tensor(query_starts, device=input.device).unsqueeze(1)
+                     + torch.arange(0, token_length, device=input.device).unsqueeze(0))
+
+        q = apply_rope(q, positions, self.rope_theta)
+        k = apply_rope(k, positions, self.rope_theta)
+
+        max_length = max([query_start + actual_length
+                          for query_start, actual_length in zip(query_starts, actual_lengths)
+                          ])
+
+        final_k = torch.zeros((batch_size, self.num_kv_heads, max_length, self.head_dim),
+                              dtype=k.dtype, device=input.device)
+        final_v = torch.zeros((batch_size, self.num_kv_heads, max_length, self.head_dim),
+                              dtype=v.dtype, device=input.device)
+
+        if caches is not None:
+            for b, kv_cache in enumerate(caches):
+                query_start = query_starts[b]
+                actual_length = actual_lengths[b]
+
+                kv_cache.write(
+                    self.attn_idx, query_start,
+                    k[b].permute(1, 0, 2)[:actual_length], v[b].permute(1, 0, 2)[:actual_length],
+                )
+                # [T_kv, H_kv, D]
+                cached_k, cached_v = kv_cache.read(self.attn_idx, query_start + actual_length)
+                final_k[b, :, :(query_start + actual_length), :] = cached_k.permute(1, 0, 2)
+                final_v[b, :, :(query_start + actual_length), :] = cached_v.permute(1, 0, 2)
+
+        # [B, H_q, T_q, D] -> [B, T_q, H_q, D] -> [B, T_q, H_q * D]
+        attn = (general_causal_gqa(q, final_k, final_v, query_start=query_starts, actual_lengths=actual_lengths)
+                .permute(0, 2, 1, 3)
+                .reshape(batch_size, token_length, -1))
+        # [B, T_q, hidden_size]
+        return self.w_out(attn)
+
 
 class TinyQwen3MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
@@ -211,6 +306,19 @@ class TinyQwen3Decoder(nn.Module):
         # [batch_size, token_length, hidden_size]
         x = self.pre_attn_layer_norm(input)
         x = self.attention(x, kv_cache, query_start) + input
+
+        middle_x = x
+
+        x = self.pre_mlp_layer_norm(x)
+        out = self.mlp(x) + middle_x
+
+        return out
+
+    def decode_batch(self, input: Tensor, caches: Sequence[KVStore],
+                     query_starts: Sequence[int], actual_length: Sequence[int]) -> Tensor:
+        # [batch_size, token_length, hidden_size]
+        x = self.pre_attn_layer_norm(input)
+        x = self.attention.adjustable_forward(x, caches, query_starts, actual_length) + input
 
         middle_x = x
 
@@ -349,4 +457,19 @@ class TinyQwen3(nn.Module):
             self, input_ids: Tensor, caches: Sequence[KVStore], positions: Sequence[int]
     ) -> Tensor:
         """Lab 06. [B, 1] IDs -> [B, 1, V]. Each sequence has its own cache."""
-        raise NotImplementedError("Lab 06: a real batched decode forward")
+        if len(input_ids) <= 0 or len(caches) <= 0 or len(positions) <= 0:
+            raise ValueError(f"Model: batch input is empty")
+        batch_size = len(input_ids)
+        if batch_size != len(caches) or batch_size != len(positions):
+            raise ValueError(f"Model: batch input and cache and positions size mismatch")
+
+        actual_length = [1 for _ in range(batch_size)]
+
+        x = self._select_token(input_ids)
+
+        for decoder in self.decoders:
+            x = decoder.decode_batch(x, caches, positions, actual_length)
+
+        x = self.final_norm(x)
+
+        return self.lm_head(x)
