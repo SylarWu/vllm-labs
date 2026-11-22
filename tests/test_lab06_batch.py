@@ -7,7 +7,7 @@ import torch
 from tests.toy import ids, make_cache, make_model
 from tinyserve.engine import Engine
 from tinyserve.generation import greedy_generate
-from tinyserve.model import apply_rope
+from tinyserve.model import apply_rope, generate_attn_position_allowed
 from tinyserve.requests import Request, Step, TokenEvent
 from tinyserve.scheduler import Scheduler
 
@@ -61,6 +61,98 @@ def test_real_batch_logits_match_different_length_cached_and_full_rows():
         actual_next = model(ids((10,)), cache, start_pos=len(prompt) + 1)
         expected_next = model(ids(prompt + (token, 10)))[:, -1:]
         torch.testing.assert_close(actual_next, expected_next, atol=2e-5, rtol=2e-5)
+
+
+def test_mixed_batch_mask_masks_future_and_uses_safe_zero_for_decode_padding():
+    allowed = generate_attn_position_allowed(
+        query_starts=[1, 0],
+        actual_lengths=[1, 3],
+        q_length=3,
+        kv_length=3,
+        on_device=torch.device("cpu"),
+    )
+    expected = torch.tensor(
+        [
+            [
+                [True, True, False],
+                [True, False, False],
+                [True, False, False],
+            ],
+            [
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ],
+        ]
+    )
+    torch.testing.assert_close(allowed, expected)
+    assert allowed.any(dim=-1).all()
+
+
+@torch.inference_mode()
+def test_forward_batch_mixed_lengths_match_full_recompute_and_preserve_next_decode():
+    model = make_model()
+    prompts = ((12, 4), (5, 2, 23), (7,))
+    chunks = ((8,), (9, 6, 17), (11, 12))
+    positions = [len(prompt) for prompt in prompts]
+    actual_lengths = [len(chunk) for chunk in chunks]
+    caches = [make_cache() for _ in prompts]
+    for prompt, cache in zip(prompts, caches):
+        model(ids(prompt), cache)
+
+    padded_ids = torch.tensor([[8, 0, 0], [9, 6, 17], [11, 12, 0]])
+    actual = model.forward_batch(
+        padded_ids,
+        caches,
+        positions=positions,
+        actual_lengths=actual_lengths,
+    )
+
+    assert torch.isfinite(actual).all()
+    for b, (prompt, chunk, position, length, cache) in enumerate(
+        zip(prompts, chunks, positions, actual_lengths, caches)
+    ):
+        expected = model(ids(prompt + chunk))[:, -length:]
+        torch.testing.assert_close(actual[b : b + 1, :length], expected, atol=2e-5, rtol=2e-5)
+        assert cache.write_length == [position + length] * model.config.num_hidden_layers
+
+    for prompt, chunk, position, length, cache, next_token in zip(
+        prompts, chunks, positions, actual_lengths, caches, (18, 19, 20)
+    ):
+        actual_next = model(ids((next_token,)), cache, start_pos=position + length)
+        expected_next = model(ids(prompt + chunk + (next_token,)))[:, -1:]
+        torch.testing.assert_close(actual_next, expected_next, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize(
+    ("positions", "actual_lengths"),
+    [
+        ([0, 0], [0, 2]),
+        ([0, 0], [-1, 2]),
+        ([0, 0], [1, 1]),
+        ([-1, 0], [1, 2]),
+        ([0], [1, 2]),
+    ],
+)
+def test_forward_batch_rejects_invalid_metadata_before_writing_cache(positions, actual_lengths):
+    model = make_model()
+    caches = [make_cache(), make_cache()]
+    with pytest.raises(ValueError):
+        model.forward_batch(
+            torch.tensor([[8, 0], [9, 10]]),
+            caches,
+            positions=positions,
+            actual_lengths=actual_lengths,
+        )
+    assert all(cache.write_length == [0, 0] for cache in caches)
+
+
+def test_decode_batch_rejects_multiple_tokens_per_row_before_writing_cache():
+    model = make_model()
+    caches = [make_cache(), make_cache()]
+    with pytest.raises(ValueError):
+        model.decode_batch(torch.tensor([[8, 0], [9, 10]]), caches, [0, 0])
+    assert all(cache.write_length == [0, 0] for cache in caches)
 
 
 def test_engine_calls_one_batched_decode_for_two_rows():

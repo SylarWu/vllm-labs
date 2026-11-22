@@ -1,6 +1,8 @@
 # Lab 06 · 真 Batch Decode 与 Chunked Prefill
 
-**状态：学习中。Scheduler 公开测试、默认兼容和剩余预算边界均已复验通过；下一步实现 `decode_batch`。**
+**状态：学习中。模型纯 decode、混合 batch、mask 和非法输入边界均已验收；下一步接入 Engine。**
+
+模型与调度侧验收：`tests/test_lab06_batch.py -k 'not engine'` 为 `12 passed, 2 deselected`。新增测试覆盖位置 0 安全占位的手推 mask、混合长度 1/3/2 的真实 logits 对拍、全输出有限性、逐层 cache 推进、后续 decode，以及非法元数据在写 cache 前被拒绝。
 
 ## Lab 01～06 的整体串联
 
@@ -506,6 +508,19 @@ query_position=0 且 key_position>=0
 这只是用“attend 到第一个 token”构造一个有限但无业务意义的占位输出，仍不能采样或写回 padding 位置。它也不会减少矩形 attention 的计算量，只是省去专门的空行 softmax 处理。
 
 代价是 `allowed_mask.any(key_dim)` 对 padding query 也会为 True，不能再据此推导 query validity；仍须以 `actual_lengths` 构造独立的有效位置判断。该方案依赖每行至少一个真实 token，因此公共入口的 `T_b>=1` 校验应作为明确前置条件。
+
+### 当前 Lab 推荐的定稿方案
+
+在进入 Engine 前，优先完成一小组边界清晰的优化，而不是继续改写 attention 数据结构：
+
+1. padding query 使用位置 0 作为安全占位，避免全掩码 softmax；真实输出仍只认 `[0,T_b)`。
+2. 在 `forward_batch` 校验二维输入、所有元数据的 batch 长度、`1<=T_b<=Tmax`、`max(T_b)=Tmax` 和 `p_b>=0`。`decode_batch` 继续只接受 `[B,1]`。
+3. 在批次入口一次构建 RoPE positions、attention allowed mask 和 `Smax`，传给各层，消除逐层重复的 Python→device 张量创建和最大值计算。
+4. 保留 `final_k/final_v` 的全零预分配和按行前缀复制。F.pad/stack 不是必然优化，varlen/paged kernel 留到性能实验阶段。
+5. 输出契约写清 `[B,Tmax,V]`，占位位置即使有限也无业务意义；后续 Engine 必须按 `T_b-1` 选择最后真实 logits，中间 chunk 不采样。
+6. 用长度 1、3、2 的混合 batch 验收：全输出有限、真实前缀逐条对拍、每层 cache 长度为 `p_b+T_b`、后续 decode 继续对拍；另为位置 0 占位的 allowed mask 保留手推小用例。
+
+这套方案避免 NaN 和复杂空行分支，同时不混淆“有限占位值”和“有效 token 输出”。完成这些后即可进入 Engine，不必提前做共享 forward 去重或底层 kernel 优化。
 
 mask 在一次 `forward_batch` 开头创建并跨层复用是合理的：所有层的 `B/Tq/Smax` 和逐行 `p/T` 相同，每层都写入同样的真实 token 数。cache 的逐层长度不变量由 KVStore 维护。
 
