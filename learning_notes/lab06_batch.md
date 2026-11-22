@@ -397,7 +397,7 @@ long 前两次 complete 都只推进 processed；最后一次发出 token 并因
 
 ### 当前测试阻塞点：K/V 聚合张量形状错误
 
-`adjustable_forward` 将 `final_k/final_v` 创建为 `[B,Smax,hidden_size]`，但 `KVStore.read` 返回 `[S_b,Hkv,D]`，而 `general_causal_gqa` 的 Q/K/V 布局约定是 `[B,H,S,D]`。这里同时缺少 head 轴，并误用了 `hidden_size`；K/V 的最后一维应是 `D`，head 轴长度应是 `Hkv`，不是 `Hq`，也不一定满足 `hidden_size=Hkv*D`。
+`forward_batch` 将 `final_k/final_v` 创建为 `[B,Smax,hidden_size]`，但 `KVStore.read` 返回 `[S_b,Hkv,D]`，而 `general_causal_gqa` 的 Q/K/V 布局约定是 `[B,H,S,D]`。这里同时缺少 head 轴，并误用了 `hidden_size`；K/V 的最后一维应是 `D`，head 轴长度应是 `Hkv`，不是 `Hq`，也不一定满足 `hidden_size=Hkv*D`。
 
 实测 `test_real_batch_logits_match_different_length_cached_and_full_rows` 在首次给 `final_k` 赋值时失败：
 
@@ -458,6 +458,97 @@ Lab 01～05：23 passed, 1 skipped
 3. 混合长度目前只由底层辅助函数支持，公共 `decode_batch` 仍固定 actual length 为 1。这是当前纯 decode 接口的边界，不代表已完成混合 batch 的输入、采样和事件接口。
 4. 每层都会从 Python 序列创建 positions/mask 张量并分配 gather 缓冲区，且 cache gather 仍是逐行 Python 循环。教学版先保留以便观察正确性；性能优化应在端到端验收后通过 profiling 决定。
 5. 普通 forward 与 adjustable forward 的投影、RoPE、残差流程存在重复。后续可抽取共享计算段，但应先保留独立实现对拍，避免为了去重同时改变两条路径而丢失参考基准。
+
+## generate_mask 重构复盘：全掩码 query 的 NaN
+
+将最后真实位置改为 `end_position=p+T-1`，并用 `prepare_position<=end_position` 判断真实 query，位置边界已经正确。padding query 被赋值为 -1 后，与非负 key 下标比较会得到全 False，因此其全部 key 都被屏蔽。
+
+但这会让该 query 的整行 scores 都是 `-inf`：
+
+```text
+softmax([-inf,-inf,...,-inf]) → NaN
+```
+
+实测纯 decode 测试通过；混合长度 1、3、2 时，真实 logits 与完整重算的最大误差仍为 `2.98e-7`，cache 长度正确，但长度为 1 和 2 的两行在 padding logits 中出现 NaN。NaN 当前被隔离在占位位置，没有污染真实位置。
+
+需要准确区分“真实结果错误”和“接口约束”：如果所有消费者都先按 `T_b` 选择真实位置，再进行采样、比较、归约或序列化，那么 padding NaN 不影响真实 token，保留它可以是一种合法设计。当前网络不会把 NaN 横向传播到真实位置：softmax 沿 key 轴独立处理每个 query，attention 中真实 query 不读取 padding query，残差、RMSNorm 和 MLP 也都按位置计算；padding K/V 又不会写入 cache。
+
+因此，“必须修复 NaN 才能进入 Engine”是过强表述。真正必须保证的是消费契约，而不是 padding 数值必须有限。
+
+可选修正方向：
+
+1. 保留全 False mask，单独标记 `valid_query=allowed.any(key_dim)`；对无有效 key 的占位行使用安全 scores（例如全零）完成 softmax，再把对应 attention 输出置零。残差路径仍可继续，但最终丢弃占位输出。
+2. 回到安全位置 clamp 的方案，attention 内不直接 mask 整行 query，只用 query validity 选择输出。
+
+不建议在最终 logits 上笼统使用 `nan_to_num` 掩盖问题，因为它也会隐藏真实位置的数值错误。
+
+### 两种可接受的设计契约
+
+**允许 padding 未定义/为 NaN。** 明确 `forward_batch` 只有每行 `[0,T_b)` 是有效输出；Engine 必须先在 `T_b-1` 取最后真实 logits，再沿 vocab 维 argmax，且中间 chunk 不采样。任何 loss、指标、比较、序列化或全张量归约都要先过滤 padding。测试重点检查真实位置有限且对拍、cache 长度和下一步 decode，无需为占位位置增加安全 softmax 开销。
+
+**要求整个返回张量有限。** 对无有效 key 的 query 做安全 softmax，并将占位 attention 输出清零。这对通用调用方和全张量测试更友好，但增加少量计算与代码，不是当前正确性的必要条件。
+
+风险来自违反契约，而不是 NaN 会自动跨行扩散。例如在完整 `[B,Tmax,V]` 上直接 `argmax/max/sum/mean`、统一取 `[:, -1]`、做未过滤的 JSON 序列化或全量 `assert_close`，都会把无效占位值带入结果。
+
+### 用位置 0 作为 padding query 的安全占位
+
+在当前不变量下，也可把无效 `query_positions` 从 -1 改为 0：
+
+```text
+query_position=0 且 key_position>=0
+→ 只有 key 0 满足 query_position>=key_position
+→ softmax 在唯一可见的 key 0 上得到概率 1
+→ 不再出现全 -inf 行和 NaN
+```
+
+每行 `T_b>=1` 时，写入后的历史前缀 `[0,p+T)` 至少包含位置 0，因此 key 0 确实是该请求的真实历史，而不是尾部 padding。真实 query 的位置和可见性完全不受这个占位值影响。
+
+这只是用“attend 到第一个 token”构造一个有限但无业务意义的占位输出，仍不能采样或写回 padding 位置。它也不会减少矩形 attention 的计算量，只是省去专门的空行 softmax 处理。
+
+代价是 `allowed_mask.any(key_dim)` 对 padding query 也会为 True，不能再据此推导 query validity；仍须以 `actual_lengths` 构造独立的有效位置判断。该方案依赖每行至少一个真实 token，因此公共入口的 `T_b>=1` 校验应作为明确前置条件。
+
+mask 在一次 `forward_batch` 开头创建并跨层复用是合理的：所有层的 `B/Tq/Smax` 和逐行 `p/T` 相同，每层都写入同样的真实 token 数。cache 的逐层长度不变量由 KVStore 维护。
+
+其他待完善点：
+
+- `forward_batch` docstring 仍写 `[B,1]`，应描述混合接口的 `[B,Tmax]` 和真实长度语义。
+- `max(actual_lengths)==Tmax` 只验证最大长度，还应保证每个 `1<=T_b<=Tmax` 且 `p_b>=0`，避免零长或负长在 cache 层以不直观的方式失败。
+- RoPE positions 和 `max_length` 仍在每层重复构建；它们与 mask 一样只依赖批次元数据，可在正确性修复后一并上移。
+
+## final K/V 的预分配与可选替代
+
+当前先创建全零 `[B,Hkv,Smax,D]`，再把每行 cache 的真实前缀复制进去，属于“预分配 + 按行 scatter”，语义正确。真实区被完整覆盖，尾部保留零值，再由 attention mask 排除；dtype 和 device 也已显式指定。
+
+也可用逐行 `F.pad` 或拼接零张量后再 `stack`，让代码更接近函数式写法，但不会产生根本性的性能优势：仍需逐行处理变长 cache，并增加临时张量或最后的堆叠复制。当前每个 cache 的 read/gather 本身已有明显开销，优化顺序应先 profiling，而不是仅替换预分配写法。
+
+不能简单把 `zeros` 换成 `empty`：尾部并未被赋值。即使设计上会 mask padding scores，未初始化的 V 若含 NaN/Inf，也可能在后续矩阵乘中造成 `0 * NaN` 一类污染。保留零初始化更直观、安全。
+
+真正减少这类 dense gather/pad 的方向是变长/分页 attention 直接消费请求历史，或展平真实 token；那属于 kernel 和元数据设计升级，不是本次正确性修正的前置条件。
+
+## padding query 的完整语义
+
+矩形混合 batch 中，第 b 行只有前 `T_b` 个 query 是真实输入，其余到 `Tmax` 的位置都是占位。它们也会经过 embedding、projection、RoPE、attention 残差和 MLP，但必须满足：
+
+- 不写入 KV cache。
+- 不采样、不产生事件。
+- 不推进 processed/generated 等真实状态。
+- 不参与最终有效 logits、指标或损失的汇总。
+
+当前实现把 padding query 的位置设为 `end_position=p+T`。例如 `p=5,T=1,Tmax=3`，位置为 `[5,6,6]`，只有位置 5 真实。真实 query 5 只能看到 key `0..5`；假 query 6 却能看到 key `0..6`，其中 key 6 是尾部零 padding。
+
+零 K 会产生一个额外 score，零 V 虽不贡献分子向量，但 softmax 分母会增加一项，因此假 query 的输出通常既不等于最后一个真实输出，也没有业务意义。这不会反向污染同一行位置 5：attention 的每个 query 独立，后续 Norm/MLP 也按位置计算，真实 query 不读取假 query 的 Q。
+
+真正的风险发生在后续消费者误用占位结果，例如统一取 `logits[:,-1]`、再次写入整行 K/V，或对全部位置做无 mask 的指标/损失汇总。
+
+一种稳妥的矩形实现是：
+
+1. 用合法的安全位置计算占位 query，例如 clamp 到最后真实位置 `p+T-1`，避免它访问额外 key。
+2. 单独保留 `valid_query[b,i]=i<T_b` 元数据。
+3. 占位 query 可以继续走完网络，但输出侧只选择真实位置；采样位置是 `T_b-1`，且中间 prefill chunk 不采样。
+
+不建议不加处理地把 `valid_query=False` 直接变成整行全 `-inf` 的 attention scores，这可能让 softmax 产生 NaN。query padding mask 常用于输出选择，key padding mask 和 causal mask 用于 attention 可见性，三者可以分开处理。
+
+当前阶段优先补齐这些契约和混合测试即可；若后续要消除 padding 计算本身，再转向真实 token 展平和 varlen attention。
 
 ## Scheduler 第一次代码复盘
 

@@ -103,11 +103,30 @@ def causal_gqa(q: Tensor, k: Tensor, v: Tensor, *, query_start: int = 0) -> Tens
     return out.to(dtype=original_dtype)
 
 
-def general_causal_gqa(q: Tensor, k: Tensor, v: Tensor,
-                       *, query_start: Sequence[int], actual_lengths: Sequence[int]) -> Tensor:
+def generate_position_allowed(query_starts: Sequence[int], actual_lengths: Sequence[int],
+                              q_length: int, kv_length: int, on_device: torch.device) -> Tensor:
+    batch_size = len(query_starts)
+    assert batch_size == len(actual_lengths)
+
+    # [B, 1]
+    start_positions = torch.tensor(query_starts, device=on_device).unsqueeze(1)
+    # [B, 1] + [B, 1] -> [B, 1]
+    end_positions = (start_positions + torch.tensor(actual_lengths, device=on_device).unsqueeze(1) - 1)
+    # [B, 1] + [1, T_q] -> [B, T_q]
+    prepare_positions = (start_positions + torch.arange(q_length, device=on_device).unsqueeze(0))
+
+    query_positions = torch.where(prepare_positions <= end_positions, prepare_positions, 0)
+
+    # [T_kv] -> [1, T_kv]
+    key_positions = torch.arange(kv_length, device=on_device).unsqueeze(0)
+    # [B, T_q, T_kv]
+    return query_positions.unsqueeze(2) >= key_positions.unsqueeze(0)
+
+
+def general_causal_gqa(q: Tensor, k: Tensor, v: Tensor, *, allowed_mask: Tensor) -> Tensor:
     """[B, H, T, D]."""
     original_dtype = q.dtype
-    on_device = q.device
+
     group_num = q.shape[1] // k.shape[1]
 
     d = q.shape[-1]
@@ -128,21 +147,7 @@ def general_causal_gqa(q: Tensor, k: Tensor, v: Tensor,
     # [B, H_q, T_q, T_kv]
     scaled_dot = torch.matmul(q_fp32, k_fp32.transpose(-1, -2)) / math.sqrt(d)
 
-    # [B, 1]
-    start_positions = torch.tensor(query_start, device=on_device).unsqueeze(1)
-    # [B, 1] + [B, 1] -> [B, 1]
-    end_positions = (start_positions + torch.tensor(actual_lengths, device=on_device).unsqueeze(1))
-    # [B, 1] + [1, T_q] -> [B, T_q]
-    prepare_positions = (start_positions + torch.arange(t_q, device=on_device).unsqueeze(0))
-
-    query_positions = torch.where(prepare_positions < end_positions, prepare_positions, end_positions)
-
-    # [T_kv] -> [1, T_kv]
-    key_positions = torch.arange(t_kv, device=on_device).unsqueeze(0)
-    # [B, T_q, T_kv]
-    allowed = query_positions.unsqueeze(2) >= key_positions.unsqueeze(0)
-
-    scaled_dot = torch.masked_fill(scaled_dot, (~allowed).unsqueeze(1), float('-inf'))
+    scaled_dot = torch.masked_fill(scaled_dot, (~allowed_mask).unsqueeze(1), float('-inf'))
 
     out = torch.matmul(torch.softmax(scaled_dot, dim=-1), v_fp32)
 
@@ -217,8 +222,8 @@ class TinyQwen3Attention(nn.Module):
         # [B, T_q, hidden_size]
         return self.w_out(attn)
 
-    def adjustable_forward(self, input: Tensor, caches: Sequence[KVStore],
-                           query_starts: Sequence[int], actual_lengths: Sequence[int]) -> Tensor:
+    def forward_batch(self, input: Tensor, caches: Sequence[KVStore],
+                      query_starts: Sequence[int], actual_lengths: Sequence[int], allowed: Tensor) -> Tensor:
         batch_size, token_length, hidden_size = input.shape
 
         q = self.w_q(input).reshape(batch_size, token_length, self.num_q_heads, self.head_dim).permute(0, 2, 1, 3)
@@ -235,8 +240,7 @@ class TinyQwen3Attention(nn.Module):
         k = apply_rope(k, positions, self.rope_theta)
 
         max_length = max([query_start + actual_length
-                          for query_start, actual_length in zip(query_starts, actual_lengths)
-                          ])
+                          for query_start, actual_length in zip(query_starts, actual_lengths)])
 
         final_k = torch.zeros((batch_size, self.num_kv_heads, max_length, self.head_dim),
                               dtype=k.dtype, device=input.device)
@@ -258,7 +262,7 @@ class TinyQwen3Attention(nn.Module):
                 final_v[b, :, :(query_start + actual_length), :] = cached_v.permute(1, 0, 2)
 
         # [B, H_q, T_q, D] -> [B, T_q, H_q, D] -> [B, T_q, H_q * D]
-        attn = (general_causal_gqa(q, final_k, final_v, query_start=query_starts, actual_lengths=actual_lengths)
+        attn = (general_causal_gqa(q, final_k, final_v, allowed_mask=allowed)
                 .permute(0, 2, 1, 3)
                 .reshape(batch_size, token_length, -1))
         # [B, T_q, hidden_size]
@@ -314,11 +318,11 @@ class TinyQwen3Decoder(nn.Module):
 
         return out
 
-    def decode_batch(self, input: Tensor, caches: Sequence[KVStore],
-                     query_starts: Sequence[int], actual_length: Sequence[int]) -> Tensor:
+    def forward_batch(self, input: Tensor, caches: Sequence[KVStore],
+                      query_starts: Sequence[int], actual_length: Sequence[int], allowed: Tensor) -> Tensor:
         # [batch_size, token_length, hidden_size]
         x = self.pre_attn_layer_norm(input)
-        x = self.attention.adjustable_forward(x, caches, query_starts, actual_length) + input
+        x = self.attention.forward_batch(x, caches, query_starts, actual_length, allowed) + input
 
         middle_x = x
 
@@ -453,23 +457,39 @@ class TinyQwen3(nn.Module):
 
         return self.lm_head(x)
 
-    def decode_batch(
-            self, input_ids: Tensor, caches: Sequence[KVStore], positions: Sequence[int]
-    ) -> Tensor:
+    def forward_batch(self, input_ids: Tensor,
+                      caches: Sequence[KVStore], *, positions: Sequence[int], actual_lengths: Sequence[int]) -> Tensor:
         """Lab 06. [B, 1] IDs -> [B, 1, V]. Each sequence has its own cache."""
         if len(input_ids) <= 0 or len(caches) <= 0 or len(positions) <= 0:
             raise ValueError(f"Model: batch input is empty")
-        batch_size = len(input_ids)
-        if batch_size != len(caches) or batch_size != len(positions):
-            raise ValueError(f"Model: batch input and cache and positions size mismatch")
 
-        actual_length = [1 for _ in range(batch_size)]
+        batch_size = len(input_ids)
+        if batch_size != len(caches) or batch_size != len(positions) or batch_size != len(actual_lengths):
+            raise ValueError(f"Model: batch input and cache and positions and actual_length size mismatch")
+
+        if len(input_ids.shape) != 2:
+            raise ValueError(f"Model: batch input has shape {input_ids.shape}")
+        batch_token_length = input_ids.shape[1]
+        if max(actual_lengths) != batch_token_length:
+            raise ValueError(f"Model: batch input and actual lengths mismatch")
+
+        max_kv_length = max([s + l for s, l in zip(positions, actual_lengths)])
 
         x = self._select_token(input_ids)
 
+        allowed_mask = generate_position_allowed(
+            positions, actual_lengths, q_length=batch_token_length, kv_length=max_kv_length, on_device=input_ids.device
+        )
+
         for decoder in self.decoders:
-            x = decoder.decode_batch(x, caches, positions, actual_length)
+            x = decoder.forward_batch(x, caches, positions, actual_lengths, allowed_mask)
 
         x = self.final_norm(x)
 
         return self.lm_head(x)
+
+    def decode_batch(
+            self, input_ids: Tensor, caches: Sequence[KVStore], positions: Sequence[int]
+    ) -> Tensor:
+        """Lab 06. [B, 1] IDs -> [B, 1, V]. Each sequence has its own cache."""
+        return self.forward_batch(input_ids, caches=caches, positions=positions, actual_lengths=[1 for _ in positions])
