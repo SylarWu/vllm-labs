@@ -109,29 +109,69 @@ class Engine:
 
         self.kv_cache[request_id].table.reserve(len(request.prompt_ids) + request.max_new_tokens - 1)
 
-    def _prepare_input_ids(self, input_ids: tuple[int, ...]) -> Tensor:
-        return torch.tensor([input_ids], dtype=torch.long, device=self.storage.device)
-
-    def _sample_next_token(self, next_logits: Tensor) -> int:
-        return torch.argmax(next_logits, dim=-1).item()
+    def _sample_next_token(self, next_logits: Tensor) -> Tensor:
+        return torch.argmax(next_logits, dim=-1)
 
     @torch.inference_mode()
     def step(self) -> list[TokenEvent]:
         """Run the next iteration. Lab 06 batches all decode rows in one forward."""
         steps = self.scheduler.plan()
 
+        if len(steps) == 0:
+            return []
+
+        batch_size = len(steps)
+        input_ids: Tensor
+        caches = [self.kv_cache[step.request_id] for step in steps]
+        positions = [step.start_pos for step in steps]
         events: list[TokenEvent] = []
-        for step in steps:
-            next_logits = self.model(
-                input_ids=self._prepare_input_ids(step.input_ids),
-                cache=self.kv_cache[step.request_id],
-                start_pos=step.start_pos,
-            )[:, -1, :]
-            next_token = self._sample_next_token(next_logits)
+        if steps[-1].phase == "decode":
+            # pure decode
+            token_length = 1
 
-            token_event = self.scheduler.complete(step=step, sampled_token=next_token)
-            events.append(token_event)
+            input_ids = torch.zeros((batch_size, token_length), dtype=torch.long, device=self.storage.device)
+            for idx, step in enumerate(steps):
+                input_ids[idx][:] = step.input_ids[0]
 
+            # [B, 1, V] -> [B, V]
+            logits = self.model.decode_batch(input_ids=input_ids, caches=caches, positions=positions)[:, -1, :]
+            # [B]
+            next_token = self._sample_next_token(logits)
+
+            for idx, step in enumerate(steps):
+                event = self.scheduler.complete(step=step, sampled_token=next_token[idx].item())
+                if event is not None:
+                    events.append(event)
+        else:
+            # decode prefill mixture
+            # [B, T, V]
+            token_length = max([len(step.input_ids) for step in steps])
+            actual_lengths = [len(step.input_ids) for step in steps]
+
+            input_ids = torch.zeros((batch_size, token_length), dtype=torch.long, device=self.storage.device)
+            for idx, step in enumerate(steps):
+                input_ids[idx, :actual_lengths[idx]] = torch.tensor(
+                    step.input_ids, dtype=torch.long, device=self.storage.device
+                )
+
+            # [B, T, V] -> [B, V]
+            logits = self.model.forward_batch(
+                input_ids=input_ids, caches=caches,
+                positions=positions, actual_lengths=actual_lengths,
+            )
+
+            for idx, step in enumerate(steps):
+                event = None
+                next_token = None
+                if step.emit_token:
+                    logit = logits[idx, actual_lengths[idx] - 1, :]
+                    next_token = self._sample_next_token(logit)
+                event = self.scheduler.complete(
+                    step=step,
+                    sampled_token=next_token.item() if next_token is not None else next_token
+                )
+                if event is not None:
+                    events.append(event)
         return events
 
     def cancel(self, request_id: str) -> bool:

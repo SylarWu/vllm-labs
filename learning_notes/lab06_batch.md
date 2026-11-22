@@ -1,6 +1,6 @@
 # Lab 06 · 真 Batch Decode 与 Chunked Prefill
 
-**状态：学习中。模型纯 decode、混合 batch、mask 和非法输入边界均已验收；下一步接入 Engine。**
+**状态：已完成。Lab 06 `15 passed`；Lab 01～06 回归 `38 passed, 1 skipped`。**
 
 模型与调度侧验收：`tests/test_lab06_batch.py -k 'not engine'` 为 `12 passed, 2 deselected`。新增测试覆盖位置 0 安全占位的手推 mask、混合长度 1/3/2 的真实 logits 对拍、全输出有限性、逐层 cache 推进、后续 decode，以及非法元数据在写 cache 前被拒绝。
 
@@ -280,6 +280,99 @@ prefill_steps
 顺序映射不能打乱，否则会把 A 的 token 提交给 B。prefill chunk 在本 lab 仍可逐个普通 forward。
 
 实现位点：[engine.py](../src/tinyserve/engine.py) 的 `step()`。验收 spy 要求第二轮有两个 decode 行时，`decode_batch` 恰好调用一次，普通 `forward` 不调用。
+
+## Engine 接入前的执行语义
+
+`Scheduler.plan()` 给的是计划，Engine 负责“执行模型 → 按 emit_token 决定是否采样 → complete 提交状态 → 过滤对外事件”。Scheduler 仍拥有请求状态，Engine 不应自行推进 processed/generated。
+
+当前 Engine 对所有 Step 都采样并 `complete(step,token)`，因此有两类问题：
+
+- 多个 decode 行仍是多次普通 forward，没有张量 batching。
+- 中间 prefill chunk 的 `emit_token=False` 仍被传入 sampled token，违反 Scheduler 契约；即使绕过校验，把 `complete` 返回的 None 直接 append 也会污染事件列表。
+
+正确的不变量是：
+
+| Step | 必须执行模型/写 KV | sampled_token | complete 返回 | Engine.step 是否收录 |
+| --- | --- | --- | --- | --- |
+| decode | 是 | token ID | TokenEvent | 是 |
+| 最后 prefill chunk | 是 | token ID | TokenEvent | 是 |
+| 中间 prefill chunk | 是 | None | None | 否 |
+
+`emit_token=False` 不是“不执行”，而是“只消费输入、写 KV、推进 processed，不生成输出”。finish_reason 为 stop/length 的 TokenEvent 仍是有效事件，过滤 None 时不能把它过滤掉。
+
+### 方案 A：Lab 基线分离执行
+
+decode 行按顺序堆叠为 `[B,1]`，调用一次 `decode_batch`；prefill chunk 逐个普通 forward。中间 chunk 不采样，最后 chunk 取最后位置采样。该方案最贴近 README，代码路径直观。
+
+### 方案 B：复用现有 forward_batch 统一执行
+
+当前模型已经支持混合长度，因此可将本 tick 所有 Step 按原顺序组成一个批次：
+
+```text
+input_ids：逐行右 padding 到 [B,Tmax]，占位 ID 可用 0
+caches：按 Step 顺序收集稳定持有的 PagedKV
+positions：各 Step.start_pos
+actual_lengths：len(Step.input_ids)，不是 Tmax
+```
+
+纯 decode tick 调用 `decode_batch`，它内部仍复用 `forward_batch`，同时满足现有 spy；混合或 prefill tick 调用 `forward_batch`。模型只返回 logits，Engine 随后逐行提交：
+
+- `emit_token=True`：取第 b 行 `actual_lengths[b]-1` 的 logits，沿 vocab 维 argmax，再 `complete(step,token)`。
+- `emit_token=False`：不采样，直接 `complete(step,None)`。
+- 只有 complete 返回非 None 时才加入 events。
+
+不能统一使用 `logits[:,-1]`，因为右侧可能是 padding。Scheduler.complete 使用 `len(step.input_ids)` 推进 processed，所以不会把占位 token 计入状态。
+
+统一执行时，`plan()` 为空要直接返回空列表，不能进入拒绝空 batch 的模型接口。一次模型调用完成后再逐行 complete 是安全的：请求 KV 相互独立，某个请求退休并释放页不会影响已经完成的整批计算。
+
+### 一个混合 tick 手推例子
+
+```text
+chat：decode，start=2，input=(20,)，emit=True
+long：prefill，start=0，input=(3,4,5)，emit=False
+```
+
+打包后：
+
+```text
+input_ids      = [[20,0,0],[3,4,5]]
+actual_lengths = [1,3]
+positions      = [2,0]
+```
+
+chat 只采样第 0 列；long 不采样。complete 后 chat 的 processed 增加 1、generated 增加 1，long 的 processed 增加 3、generated 不变，本 tick 只返回 chat 的事件。
+
+### Engine 验收顺序
+
+```bash
+.venv/bin/python -m pytest -q tests/test_lab06_batch.py -k one_batched
+.venv/bin/python -m pytest -q tests/test_lab06_batch.py -k chunked_engine
+.venv/bin/python -m pytest -q tests/test_lab06_batch.py
+```
+
+第一条验证纯 decode 只调用一次 `decode_batch`；第二条验证中间 chunk 无事件、输出与完整重算一致，以及半段 prefill 取消后释放全部页。统一混合执行还应补一个 decode+prefill 同 tick 的 spy，验证 `forward_batch` 恰好调用一次。
+
+## Engine 第一次代码复盘
+
+首次实现已做到：空计划返回、纯 decode 单次 `decode_batch`、混合 tick 单次 `forward_batch`、按 actual length 选择采样位置、中间 chunk 提交 None、过滤空事件，以及退休后释放页。原始验收为 Lab 06 `14 passed`，Lab 01～05 `23 passed, 1 skipped`。
+
+新增混合 spy 验证了 decode+prefill 同 tick 的 input shape、positions、actual lengths 和单次调用，主执行路径正确。
+
+### TokenEvent.token_id 不应是 0 维 Tensor
+
+`_sample_next_token` 改为返回 Tensor 后，纯 decode 将 `next_token[idx].int()` 传给 complete，混合路径也直接传入 0 维 argmax Tensor。它们都不是 `Step/TokenEvent` 契约中的 Python `int`。
+
+原有输出列表对拍仍通过，是因为标量 Tensor 与 int 的比较可转换成标量布尔值；这不代表类型契约正确。后续 tokenizer、JSON/SSE 序列化和严格数据校验会暴露问题。
+
+应在 Engine 每行调用 `scheduler.complete` 前通过 `.item()` 等方式转换为 Python int；批量 argmax 本身可以保留 Tensor。新增纯 decode 与混合分支的 `type(event.token_id) is int` 断言后，当前两条路径均能复现失败，待实现修正后复验。
+
+修正后两条分支均已在 complete 前调用 `.item()`，类型断言与全部 Lab 06 测试通过。重复注释和无用的 `_prepare_input_ids` 已清理。
+
+### 非阻塞的可读性优化
+
+- 用 `steps[-1].phase=="decode"` 判断纯 decode 依赖 Scheduler“decode 在前、prefill 在后”的隐式顺序；`all(...)` 更直接、稳健。
+- 纯 decode 与混合分支的 batch 打包有重复，可共享构造逻辑，但不必为了去重改变已通过的执行路径。
+- 混合分支中遗留的“pure decode”注释和未再使用的 `_prepare_input_ids` 可清理。
 
 ## 第二部分：为什么需要 chunked prefill
 

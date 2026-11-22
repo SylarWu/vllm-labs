@@ -167,7 +167,33 @@ def test_engine_calls_one_batched_decode_for_two_rows():
     assert len(events) == 2
     batched.assert_called_once()
     serial.assert_not_called()
+    assert all(type(event.token_id) is int for event in events)
     assert not engine.has_work
+
+
+def test_engine_calls_one_forward_batch_for_mixed_decode_and_prefill():
+    model = make_model()
+    engine = Engine(
+        model, num_blocks=16, block_size=2, max_active=2, max_batch_tokens=4, max_prefill_chunk=2
+    )
+    engine.submit(Request("chat", (1, 2), 3))
+    engine.submit(Request("long", (3, 4, 5, 6, 7), 1))
+    first_events = engine.step()
+    assert [event.request_id for event in first_events] == ["chat"]
+
+    with patch.object(model, "forward_batch", wraps=model.forward_batch) as batched:
+        with patch.object(model, "forward", wraps=model.forward) as serial:
+            with patch.object(model, "decode_batch", wraps=model.decode_batch) as decode:
+                events = engine.step()
+
+    batched.assert_called_once()
+    serial.assert_not_called()
+    decode.assert_not_called()
+    assert batched.call_args.kwargs["input_ids"].shape == (2, 2)
+    assert batched.call_args.kwargs["positions"] == [2, 2]
+    assert batched.call_args.kwargs["actual_lengths"] == [1, 2]
+    assert [event.request_id for event in events] == ["chat"]
+    assert all(type(event.token_id) is int for event in events)
 
 
 def test_chunked_engine_matches_full_recompute_and_cancelled_prefill_releases_pages():
