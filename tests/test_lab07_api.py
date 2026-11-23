@@ -35,18 +35,25 @@ def test_chat_completion_and_sse_share_the_same_text_and_finish_reason():
             assert plain.status_code == 200
             data = plain.json()
             assert (data["object"], data["model"]) == ("chat.completion", "toy")
+            assert isinstance(data["created"], int)
             assert data["choices"][0]["message"] == {"role": "assistant", "content": "你好"}
             assert data["choices"][0]["finish_reason"] == "stop"
             streamed = await client.post("/v1/chat/completions", json=payload(stream=True))
             assert streamed.status_code == 200
             assert streamed.headers["content-type"].startswith("text/event-stream")
-            chunks = [line.removeprefix("data:").strip() for line in streamed.text.splitlines() if line.startswith("data:")]
+            chunks = [line.removeprefix("data:").strip() for line in streamed.text.splitlines() if
+                      line.startswith("data:")]
             assert chunks[-1] == "[DONE]" and chunks.count("[DONE]") == 1
             frames = [json.loads(chunk) for chunk in chunks[:-1]]
             assert all(frame["object"] == "chat.completion.chunk" for frame in frames)
+            assert all(frame["model"] == "toy" for frame in frames)
+            assert len({frame["id"] for frame in frames}) == 1
+            assert len({frame["created"] for frame in frames}) == 1
+            assert isinstance(frames[0]["created"], int)
             choices = [frame["choices"][0] for frame in frames]
             assert "".join(choice["delta"].get("content") or "" for choice in choices) == "你好"
             assert choices[-1]["finish_reason"] == "stop"
+
     asyncio.run(run())
 
 
@@ -62,14 +69,55 @@ def test_http_validation_does_not_start_the_backend():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             assert (await client.post("/v1/chat/completions", json=payload(model="missing"))).status_code == 404
             for invalid in (
-                payload(max_tokens=0),
-                payload(max_tokens=9),
-                payload(messages=[]),
-                payload(messages=[{"role": "bad", "content": "Hi"}]),
-                payload(temperature=0.4),
+                    payload(max_tokens=0),
+                    payload(max_tokens=9),
+                    payload(messages=[]),
+                    payload(messages=[{"role": "bad", "content": "Hi"}]),
+                    payload(temperature=0.4),
             ):
                 response = await client.post("/v1/chat/completions", json=invalid)
                 assert response.status_code == 422, response.text
+
+    asyncio.run(run())
+
+
+def test_http_validation_rejects_missing_and_wrong_shaped_fields():
+    class UnexpectedBackend:
+        model = "toy"
+
+        def stream(self, request):
+            raise AssertionError("backend called for invalid input")
+
+    def without(key):
+        data = payload()
+        del data[key]
+        return data
+
+    async def run():
+        app = create_app(UnexpectedBackend())
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # 缺少字段/字段类型错误是 422；未知模型字符串仍由上一测试验证为 404。
+            invalid = (
+                without("model"),
+                without("messages"),
+                without("max_tokens"),
+                payload(model=None),
+                payload(messages=None),
+                payload(messages="user"),
+                payload(messages=[None]),
+                payload(messages=[{}]),
+                payload(max_tokens=True),
+                payload(stream=None),
+                payload(temperature=None),
+                payload(temperature=False),
+            )
+            for data in invalid:
+                response = await client.post("/v1/chat/completions", json=data)
+                assert response.status_code == 422, (
+                    data, response.status_code, response.text
+                )
+
     asyncio.run(run())
 
 
@@ -100,6 +148,7 @@ def test_inflight_limit_recovers_when_request_finishes():
                 done = await asyncio.wait_for(first, 2)
             assert done.status_code == 200
             assert (await client.post("/v1/chat/completions", json=payload())).status_code == 200
+
     asyncio.run(run())
 
 
@@ -150,6 +199,7 @@ def test_asgi_disconnect_closes_stream_and_restores_admission():
         backend.stream = finish
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             assert (await client.post("/v1/chat/completions", json=payload())).status_code == 200
+
     asyncio.run(run())
 
 
@@ -204,6 +254,7 @@ def test_engine_backend_routes_concurrent_rows_and_cancels_early_close():
         assert (await anext(stream)).delta == "C"
         await stream.aclose()
         assert len(engine.cancelled) == 1 and engine.active == {}
+
     asyncio.run(run())
 
 

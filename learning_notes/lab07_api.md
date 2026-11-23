@@ -541,3 +541,224 @@ e3 stable="你A" → 入队 delta="A"
 Backend 可以进入 HTTP 集成阶段。finished 已改为只在终止时单向置 True，冗余 stable_text 已删除，返回值和 token_ids 类型注解已规范化，finally 已处理 state=None。整理后复验仍为 `5 passed`。
 
 最终 yield 后是否恢复仍由消费者决定，create_app 必须保证关闭 backend stream。
+
+## create_app 知识导入：FastAPI、SSE 与准入
+
+### FastAPI app factory 与路由
+
+本项目使用应用工厂：
+
+```python
+def create_app(backend, *, max_inflight=8, max_output_tokens=128):
+    app = FastAPI()
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(...):
+        ...
+
+    return app
+```
+
+`FastAPI()` 创建 ASGI app；`@app.post` 注册 HTTP method + path 与 endpoint 的映射；endpoint 返回 dict 时 FastAPI 自动编码为 JSON。每次 create_app 都产生独立 app 和独立 inflight 状态，避免不同测试共享计数。
+
+backend、max_inflight、max_output_tokens 通过闭包提供给 endpoint，不需要全局变量。若 endpoint 修改外层 inflight 整数，需要使用 nonlocal；只读取则不需要。
+
+当前 api.py 将 FastAPI 放在 TYPE_CHECKING 下，仅用于静态类型。create_app 真正运行时必须能取得 FastAPI、Body/HTTPException 和 StreamingResponse 等运行态类，因此需要增加正常导入或函数内导入。
+
+### 请求体解析与校验
+
+FastAPI 常见两种方式：
+
+1. Pydantic BaseModel：声明 schema，自动解析和生成 422，适合稳定复杂模型；
+2. dict/Request：自行检查字段，适合本 lab 学习精确状态码和动态 max_output_tokens。
+
+无论采用哪种方式，都要在调用 backend.stream 或提交 Engine 前完成：
+
+- model 必须等于 backend.model，否则 404；
+- messages 必须是非空列表，每项 role 为 system/user/assistant，content 为字符串；
+- max_tokens 为整数且在 1..max_output_tokens；
+- temperature 只能为 0；
+- stream 若出现应为布尔值，缺省为 False；
+- 其他格式错误为 422。
+
+Python 中 bool 是 int 子类，`isinstance(True, int)` 为 True。若字段要求真正的整数，应额外排除 bool。非法请求即使最终返回 422，也不能已经创建 backend stream 或分配 Engine 资源。
+
+HTTPException(status_code=..., detail=...) 可显式产生 404/422/429。FastAPI 对 JSON 解析失败和声明 schema 校验失败通常自动生成 422。
+
+内部 ChatRequest/Message 与 HTTP JSON 是不同层：HTTP 层解析后构造不可变内部对象，backend 不需要知道 Pydantic、HTTPException 或 ASGI。
+
+### 普通 chat.completion 响应
+
+普通响应消费同一 backend.stream，累计所有 event.delta，并保留最终 finish_reason：
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1234567890,
+  "model": "toy",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "你好"},
+    "finish_reason": "stop"
+  }]
+}
+```
+
+id 和 created 在请求开始时生成一次。HTTP 响应 id 与 Engine 内部 request_id 可以不同，因为它们属于不同层；同一 HTTP 请求的所有响应帧必须复用同一个 HTTP id/created/model。
+
+普通和流式响应必须消费同一个 backend 契约，不能分别实现两套生成逻辑。使用 contextlib.aclosing 包住 backend.stream，保证聚合异常、任务取消或提前退出时关闭生成器。
+
+### StreamingResponse 与 SSE
+
+StreamingResponse 接收 body iterator/async generator，把每次 yield 的字符串或字节编码为后续 http.response.body：
+
+```text
+endpoint return StreamingResponse(body(), media_type="text/event-stream")
+→ 先发送 200 和响应头
+→ 每次 body yield 发送一段响应体
+```
+
+SSE 业务帧：
+
+```text
+data: <JSON>\n\n
+```
+
+结束标记：
+
+```text
+data: [DONE]\n\n
+```
+
+JSON chunk 的 object 为 chat.completion.chunk，choices[0] 包含 index=0、delta={"content": event.delta} 和本事件 finish_reason。最后业务事件应同时保留 delta 与 finish_reason；[DONE] 只发送一次。空 delta 仍可有合法 chunk，它不代表结束。
+
+json.dumps 可将中文转义为 Unicode escape，消费者 json.loads 后文本相同；ensure_ascii=False 则直接保留 UTF-8 中文，二者都符合 JSON。
+
+状态码与校验必须在返回 StreamingResponse 前决定。响应头一旦以 200 发出，body 内部才发现过载或参数错误，就不能再可靠地改成 429/422。
+
+### inflight 计数与所有权
+
+本 lab 的 429 是立即拒绝，不是排队等待。单事件循环中，同步的“检查 inflight + 增加计数”没有 await，可作为原子临界区，不需要 semaphore/lock。
+
+Semaphore.acquire 通常用于等待名额，而测试要求超载请求立刻 429，因此直接使用计数更直观。
+
+普通响应：
+
+```text
+校验 → 占用名额 → try 聚合完整响应 → finally 释放 → return
+```
+
+流式响应不能在 endpoint return 的 finally 中释放：
+
+```text
+错误：endpoint try → return StreamingResponse → finally 立即释放
+此时 body 尚未消费，实际并发请求数被低估
+```
+
+应把名额所有权转交给 body generator：
+
+```text
+endpoint 校验并占用名额
+→ 构造 body
+→ body try/finally 负责消费期间持有并在结束时释放
+→ endpoint return StreamingResponse(body)
+```
+
+释放必须覆盖正常 DONE、客户端断流、任务取消和 backend 异常。
+
+### 关闭传播与原始 ASGI 测试
+
+SSE body 中应用 aclosing 包住 backend.stream：
+
+```text
+StreamingResponse 检测 disconnect/取消 body task
+→ body 的 async with/finally 退出
+→ backend.stream.aclose
+→ backend 对未完成请求 cancel 并删除状态
+→ body finally 释放 inflight
+```
+
+正常路径消费到终止事件后仍要完成 backend 迭代或 aclose，再发送/结束 DONE，不能只从 body break 而不关闭内部 stream。
+
+HTTPX ASGITransport 的 client.post 会收集完整响应，适合检查最终 SSE 文本，不足以证明真实首帧后的断流。原始 ASGI 测试直接调用 app(scope, receive, send)：receive 首次给 http.request，首帧 hello 发出后给 http.disconnect；send 观察 response.body。验收要求 backend closed 且之后名额恢复。
+
+### 推荐实现与验收顺序
+
+1. 路由、请求解析和校验：先通过 test_http_validation_does_not_start_the_backend；
+2. 普通响应与 SSE：通过 test_chat_completion_and_sse_share_the_same_text_and_finish_reason；
+3. inflight 计数：通过 test_inflight_limit_recovers_when_request_finishes；
+4. 关闭传播：通过 test_asgi_disconnect_closes_stream_and_restores_admission；
+5. 最后运行整个 Lab 07 和 Lab 01～06 回归。
+
+## create_app 第一次实现复盘
+
+首次全文件复验：`6 passed, 3 failed`。Backend 和已有 HTTP 校验测试通过，普通/SSE 响应、inflight 和断流尚未通过。
+
+### 普通 JSON 的编码与 schema
+
+`JSONResponse(json.dumps(data))` 先把 dict 转成 JSON 字符串，再由 JSONResponse 把这个字符串编码成 JSON string，形成双重编码。客户端 response.json() 得到 str 而不是 dict，因此后续 `data["object"]` 报 string indices must be integers。
+
+应让 JSON 序列化只发生一次：传 dict 给 JSONResponse，或直接从 endpoint 返回 dict。
+
+普通 choices[0].message 还需是 `{"role":"assistant","content":...}`，不能只是累计字符串。created 应使用 Unix 秒；time.time_ns()//1000 是微秒，不是 OpenAI 风格秒时间戳。
+
+### StreamingResponse 的调用对象和 SSE 帧
+
+body 是 async generator function，body() 才是 async iterable。StreamingResponse(body) 会让 Starlette 把 function 当同步 iterable，出现 TypeError: function object is not iterable。
+
+还需显式 media_type="text/event-stream"，每个业务帧以 `data: ` 开头，DONE 为 `data: [DONE]\n\n`。chunk 应与普通响应一样携带 model。
+
+### inflight 的边界和释放位置
+
+`if inflight > max_inflight` 在 inflight==max_inflight 时仍放行，正确拒绝边界应从等于上限开始。当前 max_inflight=1 的第二请求因此进入 SlowBackend 并等待，最终测试超时。
+
+外层 endpoint finally 在 return StreamingResponse 时立即释放名额，不能覆盖 body 的实际消费期。流式名额应由 body generator 的 finally 持有和释放；普通聚合响应则可由 endpoint finally 释放。
+
+### 现有校验通过不代表非法输入覆盖完整
+
+直接索引 payload["model"]、payload["messages"]、payload["max_tokens"]，缺少键会 KeyError；messages=None、字符串或元素 None/{} 会在 len、迭代或 message["role"] 处产生 TypeError/KeyError，成为 500。
+
+model 非字符串属于格式错误，应与未知模型字符串 404 区分。stream=None 和 temperature=None 当前被跳过校验；False==0 使 temperature=False 被当作合法零值。这些可选字段若出现，也应验证其声明类型。
+
+新增 `test_http_validation_rejects_missing_and_wrong_shaped_fields` 覆盖缺少必需键、model/messages 错误类型、消息元素结构、bool max_tokens，以及 None/bool 可选参数。测试关闭 ASGI app exception 透传，以便观察服务端实际状态码并断言统一为 422。
+
+## create_app 第二次实现复盘
+
+最新全文件结果：`9 passed, 1 failed`。普通 JSON、SSE、inflight、ASGI 断流均已通过。
+
+唯一当前失败是缺少 model 字段返回 404。需要区分：
+
+| 输入 | 语义 | 状态码 |
+| --- | --- | --- |
+| 缺少 model | 请求格式错误 | 422 |
+| model=None | 字段类型错误 | 422 |
+| model=非字符串 | 字段类型错误 | 422 |
+| model="missing" | 格式合法，但模型资源不存在 | 404 |
+
+原 `test_http_validation_does_not_start_the_backend` 中 `"missing" -> 404` 仍通过。新增校验测试只把缺失/None/错误类型归入 422，没有改变未知字符串的语义。实现应先做存在性和类型校验，再做模型查找，不能用一个组合条件把所有失败都映射为 404。
+
+后续仍需注意：
+
+- temperature 当前仅检查非 None 且 ==0；False==0，因此 temperature=False 仍会被接受。新增用例在 model 分支修正后会继续检查到这一项。
+- req_created=time.time() 是浮点秒，而 normal/stream helper 注解为 int；OpenAI 风格 created 通常使用整数 Unix 秒，可显式取整。
+
+## create_app 第三次代码复盘
+
+当前仍为 `9 passed, 1 failed`，失败已推进到 temperature=False：bool 是 int 子类，因此仅判断 isinstance(value, int) 或 isinstance(value, float) 不能排除布尔值。 temperature 应像 max_tokens 一样显式排除 bool。
+
+Lab 01～06 回归保持 `38 passed, 1 skipped`。
+
+响应测试已补充元数据契约：普通响应 created 为 int；同一次 SSE 的所有 chunk 只有一个 id、一个 created，model 全为 toy，首帧 created 为 int。当前 time.time() 浮点值会被该测试识别。
+
+### 普通响应的非阻塞优化
+
+当前 normal_chat_completion 先把全部 ChatEvent 收集为 list，再第二次遍历累计文本，并使用 events[-1] 取终止原因。backend 契约保证至少有终止事件时功能正确，但可以简化为单次 aclosing + async for：
+
+- 逐事件把 delta append 到文本片段列表；
+- 遇到 finish_reason 时保存；
+- 最后 join 片段；
+- 避免额外事件列表、二次遍历和 events[-1] 空列表风险；
+- aclosing 保证聚合异常或任务取消时关闭 backend。
+
+content 反复使用不可变字符串 += 可能产生重复拷贝；片段列表 + join 更适合累积较长文本。以上属于清晰度和资源使用优化，不应优先于 temperature/created 契约修正。
