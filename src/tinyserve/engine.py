@@ -52,8 +52,8 @@ class Engine:
             max_active,
             max_batch_tokens=max_batch_tokens,
             max_prefill_chunk=max_prefill_chunk,
-            try_admit=self.on_try_admit,
-            on_retire=self.on_retire,
+            try_admit=self._on_try_admit,
+            on_retire=self._on_retire,
         )
 
     @property
@@ -64,7 +64,7 @@ class Engine:
     def has_work(self) -> bool:
         return len(self.scheduler.active_ids) + len(self.scheduler.waiting_ids) > 0
 
-    def on_try_admit(self, request: Request) -> bool:
+    def _on_try_admit(self, request: Request) -> bool:
         reserved_tokens = len(request.prompt_ids) + request.max_new_tokens - 1
         required_blocks = (reserved_tokens - 1) // self.block_size + 1
 
@@ -74,28 +74,35 @@ class Engine:
         self._prepare_kv_cache(request)
         return True
 
-    def on_retire(self, request_id: str) -> None:
+    def _on_retire(self, request_id: str) -> None:
         if request_id not in self.kv_cache.keys():
             return
 
         cache = self.kv_cache.pop(request_id)
         cache.table.release()
 
-    def submit(self, request: Request) -> None:
-        """Reject requests that cannot ever fit. Reserve on admission."""
+    def is_applicable(self, request: Request) -> tuple[bool, str]:
         if request is None:
-            raise ValueError("Engine: request must provided")
+            return False, "request must provided"
         if len(request.request_id) <= 0:
-            raise ValueError("Engine: request must provide request_id")
+            return False, "request must provide request_id"
         if len(request.prompt_ids) <= 0:
-            raise ValueError("Engine: request prompt is empty")
+            return False, "request must provide prompt_ids"
         if request.max_new_tokens <= 0:
-            raise ValueError("Engine: request requires token generation at least one")
+            return False, "request requires token generation at least one"
 
         reserved_tokens = len(request.prompt_ids) + request.max_new_tokens - 1
         required_blocks = (reserved_tokens - 1) // self.block_size + 1
         if required_blocks > self.num_blocks:
-            raise ValueError("Engine: request ask too much cache")
+            return False, "request requires too much cache"
+
+        return True, ""
+
+    def submit(self, request: Request) -> None:
+        """Reject requests that cannot ever fit. Reserve on admission."""
+        allow, reason = self.is_applicable(request)
+        if not allow:
+            raise ValueError("Engine: " + reason)
 
         self.scheduler.submit(request)
 

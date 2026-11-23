@@ -1,6 +1,6 @@
 # Lab 07 · 流式服务与取消
 
-**状态：进行中，EngineChatBackend 已完成当前验收。** Backend 的并发路由、提前关闭、任务取消、UTF-8 稳定前缀、peer 终止事件交付和积压 delta 测试合计 `5 passed`；`create_app` 的普通响应、参数校验、SSE 和断流测试尚未实现。Lab 01～06 回归基线为 `38 passed, 1 skipped`。
+**状态：已完成。** Lab 07 为 `23 passed`，Lab 01～07 回归为 `61 passed, 1 skipped`。普通请求重复被拒绝、SSE 断流后关合失败的计数回归均已通过。见[父类退出后关闭 body 与最新复验](#父类退出后关闭-body-与最新复验)。
 
 异步语法与 `asyncio`、ASGI 工具包的基础解释见 [Python 异步语法与工具包](python_async.md)。
 
@@ -656,7 +656,7 @@ Semaphore.acquire 通常用于等待名额，而测试要求超载请求立刻 4
 此时 body 尚未消费，实际并发请求数被低估
 ```
 
-应把名额所有权转交给 body generator：
+让 body generator 持有名额，能覆盖它已经开始迭代且能够退出的路径：
 
 ```text
 endpoint 校验并占用名额
@@ -665,11 +665,11 @@ endpoint 校验并占用名额
 → endpoint return StreamingResponse(body)
 ```
 
-释放必须覆盖正常 DONE、客户端断流、任务取消和 backend 异常。
+完整的名额作用域还要覆盖发送响应头到首次迭代之间，以及外层发送期间的取消。参见[准入、断流与取队列改动复查](#准入断流与取队列改动复查)。
 
 ### 关闭传播与原始 ASGI 测试
 
-SSE body 中应用 aclosing 包住 backend.stream：
+SSE body 中使用 aclosing 包住 backend.stream。取消落在 body 正等待下一条 backend 事件时，这条清理链可以在当前请求中执行：
 
 ```text
 StreamingResponse 检测 disconnect/取消 body task
@@ -679,7 +679,7 @@ StreamingResponse 检测 disconnect/取消 body task
 → body finally 释放 inflight
 ```
 
-正常路径消费到终止事件后仍要完成 backend 迭代或 aclose，再发送/结束 DONE，不能只从 body break 而不关闭内部 stream。
+当前正常路径先发送末个 JSON 帧和 DONE，随后 Starlette 再拉一次 body，恢复到 `return` 后退出 `aclosing`，显式关闭仍挂在终止 `yield` 的 backend。提前停止消费时，要由消费方在自己的退出路径显式关合外层生成器。
 
 HTTPX ASGITransport 的 client.post 会收集完整响应，适合检查最终 SSE 文本，不足以证明真实首帧后的断流。原始 ASGI 测试直接调用 app(scope, receive, send)：receive 首次给 http.request，首帧 hello 发出后给 http.disconnect；send 观察 response.body。验收要求 backend closed 且之后名额恢复。
 
@@ -762,3 +762,152 @@ Lab 01～06 回归保持 `38 passed, 1 skipped`。
 - aclosing 保证聚合异常或任务取消时关闭 backend。
 
 content 反复使用不可变字符串 += 可能产生重复拷贝；片段列表 + join 更适合累积较长文本。以上属于清晰度和资源使用优化，不应优先于 temperature/created 契约修正。
+
+## 上一版复验与代码审查
+
+Python 3.12.7、Starlette 1.10.0、Uvicorn 0.54.0，使用本地虚拟环境。两条命令分别得到 `10 passed` 和 `48 passed, 1 skipped`，跳过的是可选真权重测试。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tests/test_lab07_api.py
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q --ignore=tests/test_lab08_bench.py
+```
+
+当前实现已经对齐 404、422、429 契约，普通与流式响应共享后端，同流元数据稳定，入队时固定每条 delta，终止事件携带最后一段内容。HTTP 准入计数与引擎的 `max_active`、KV 页准入各自约束不同资源。待修的优先级如下。
+
+| 优先级与位置 | 现象及原因 | 练习方向 |
+| --- | --- | --- |
+| 高 · [api.py:217](../src/tinyserve/api.py#L217)、[api.py:253](../src/tinyserve/api.py#L253) | endpoint 已取得名额，Starlette 先发送响应头。原始 ASGI 2.3 探针在发送头时阻塞并断开，body 从未进入 `try`，后续请求持续 429。此时没有 Engine 工作或页泄漏，泄漏的是 HTTP 名额。 | 让覆盖整个响应调用的外层承担释放，从发送响应头前持有至调用返回或抛错。使释放职责唯一，移除与该职责重叠的 body 释放。给尚未启动的生成器调用 `aclose()` 也不会执行其函数体内的 `finally`。 |
+| 高 · [api.py:253](../src/tinyserve/api.py#L253)～[api.py:279](../src/tinyserve/api.py#L279) | body 已 `yield` 首块时，框架在 body 外执行 `await send`。原始 ASGI 2.3 探针在此处取消发送，2.4 探针令 `send` 抛 `BrokenPipeError`；两者在 ASGI 调用退出时都仍有 Engine 请求和保留的页，紧接着请求 429。此次运行在事件循环继续调度生成器收尾后恢复 200。 | 在消费 body 的外层 `finally` 显式等待 `body.aclose()`，再保证名额归还。顺序为结束响应体、关闭后端、释放名额，关闭抛错时仍要释放名额。AnyIO 已取消作用域中需要异步等待的短清理可用有边界的 shield。 |
+| 中 · [api.py:130](../src/tinyserve/api.py#L130)、[api.py:135](../src/tinyserve/api.py#L135)、[engine.py:95](../src/tinyserve/engine.py#L95) | `max_tokens` 合法时，渲染后的 prompt 加输出预算仍可能永远放不进页池。6 页 × 2 token 的探针发送 13 token prompt，流已经发出 200，再由 `Engine.submit` 抛出 `ValueError`，没有 SSE 业务帧，下一条合法请求仍获 200。 | 在发送响应头前做可预测的、无副作用的输入和容量校验，并复用 render 后的 IDs。把无法容纳的请求和暂时无空闲页的请求区分开，前者可映射为 422，后者继续遵循 Engine 等待准入策略。 |
+| 中 · [api.py:138](../src/tinyserve/api.py#L138)～[api.py:150](../src/tinyserve/api.py#L150) | 检查队列为空后经过 `sleep(0)`，其他流可能已经把本流事件投递进来。两个流各拉一次首 token 的探针中，A 的 tick 给 A/B 投递首 token，B 恢复时又先跑了一个 tick，再消费已经就绪的首 token。顺序正确，但 B 的首帧多等了一轮同步计算。 | `sleep(0)` 返回后重查本流队列，有现成事件就回到取事件路径。 |
+| 优化 · [api.py:96](../src/tinyserve/api.py#L96)～[api.py:113](../src/tinyserve/api.py#L113) | 每步重新解码所有累计 ID，长输出累计解码工作量可能接近平方级。去掉末尾 U+FFFD 是启发式，合法的字面 `�` 或最后仍残缺的字节都需要明确策略。按旧长度切片依赖解码结果延长已承诺的前缀。 | 保留玩具实现时，记录前缀假设并决定终止时的尾部策略。若 tokenizer 暴露合适的字节级接口，再考虑真正的增量解码。 |
+
+原始 ASGI 探针使用小模型、真实 `Engine` 和每次新建的单名额 app。6 页中的 3 页在首 token 后仍被请求占用。启动前断流保持 6 页空闲，后续名额不恢复。发送中断流时即刻只有 3 页空闲，探针让事件循环继续运行后恢复 6 页。既有断流用例在首块送出后让后端挂在等待下一条事件的位置，覆盖的是内层正在执行的取消路径。
+
+## 从一次 POST 逐帧推演
+
+以探针的 mock tokenizer 和真实 toy Engine 为例。prompt 有 3 个 token，`max_prefill_chunk=2`，输出限额 4，忽略 EOS，四个输出 ID 都被探针显示为 `B`。
+
+1. FastAPI 读取 ASGI `http.request`，调用 endpoint 校验并占用 HTTP 名额，生成对外的 `chatcmpl-…` 和 `created`。同步 helper 调用 `body()` 得到异步生成器并构造响应。Starlette 先发 `http.response.start`（200），再调用 body 的 `__anext__`。
+2. body 创建 backend 生成器并进入 `aclosing`。内层 `async for` 第一次拉取时，backend 才 render prompt、生成内部 ID、初始化状态、`Engine.submit`。此时请求进入等待队列。
+3. 队列空时 `await asyncio.sleep(0)` 主动让出循环，其他 HTTP 请求有机会完成入队。恢复后同步 `Engine.step()`，同 tick 的所有输出按内部请求 ID 路由。tick 同步段里 tokenizer、forward、采样、入队都由当前任务执行。
+
+| Tick 或消费动作 | 引擎与后端 | ASGI / SSE |
+| --- | --- | --- |
+| #1 · prefill 第一段 | 处理 prompt 的前 2 个 token，只更新 KV 和 processed 游标。无输出事件。 | 无业务帧，body 仍在等待首个 `ChatEvent`。 |
+| #2 · prefill 最后一段 | 处理 prompt 最后 1 个 token，以最后位置 logits 采样首个输出 token。计算并入队 `ChatEvent("B", None)`。 | body 被唤回，序列化并 `yield` 首个 `data: <JSON>\n\n`，Starlette 随后 `await send`。 |
+| #3、#4 · decode | 各消费上一轮生成的 token，分别采样一条新 token。 | 按顺序发送第二、第三条 JSON 帧。 |
+| #5 · decode 触及长度上限 | scheduler 先退休请求并回收页，再返回带 `length` 的最后一个 `TokenEvent`。backend 标记 `finished` 并投递末个 delta。 | 发末个 JSON 帧，仍携带 `content="B"` 与 `finish_reason="length"`。遇 EOS 则优先标记 `stop`。 |
+| 框架再拉 body | body 从末个 JSON `yield` 之后恢复，看到终止原因。 | `yield "data: [DONE]\\n\\n"`，Starlette 再发送一次。 |
+| 框架再拉 body | body 从 DONE 之后恢复并 `return`，`aclosing` 显式关闭还挂在最后一次 `yield event` 的 backend。后端删状态，body `finally` 归还 HTTP 名额。 | `http.response.body` 空字节、`more_body=False`，响应传输结束。 |
+
+真实 tokenizer 可能在输出字节尚未拼成完整字符时产生空 delta。本实现仍送 JSON 帧。累计字节 `e4 bd a0` 的三个输出 token 可以对应 `""`、`""`、`"你"`。SSE 客户端按空行组装消息，传输层可能拆分或合并这些字节。JSON 里的 `id` 属于业务数据，协议的 `id:` 行承担 SSE 的事件游标。当前协议用 `[DONE]` 标记业务结束，ASGI 用 `more_body=False` 标记响应体结束。 [SSE 规范](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream) · [ASGI HTTP 规范](https://asgi.readthedocs.io/en/latest/specs/www.html)
+
+断流时关注当时的栈位置。若取消落在 backend 的 `await asyncio.sleep(0)` 或其它内部等待，取消向外展开，backend 删除状态并 `Engine.cancel`，最后 body 归还名额。若取消落在框架的 `await send`，body 保持挂在 `yield`，需由框架层的消费方显式关合。若同步 `step()` 正在运行，事件循环要等这个 tick 返回后才能处理取消。
+
+## 准入、断流与取队列改动复查
+
+### 名额从通过准入开始持有
+
+新版把流式 `inflight += 1` 放在第一条 `ChatEvent` 到达之后，把普通请求的占用放在 `await normal_chat_completion` 前。普通路径的检查和增加之间没有挂起点。流式路径的检查和增加之间可能已响应 200、提交 Engine、等待准入、执行多轮 prefill。通过准入的请求在这段期间也占服务容量。
+
+| 最新探针 | 实测 |
+| --- | --- |
+| ASGI 2.3，发送响应头时断开 | body 未进入，计数保持 0，6 个 KV 页全空闲；上一版的这条泄漏路径已消除。 |
+| body 等待第一条事件时断开 | `finally` 仍减 1，计数变成 -1。进入 `async for` 后、首事件前发生异常或空迭代也走未加先减的路径。 |
+| `max_inflight=1`，两条请求都卡在 backend 首事件前 | 两条都进入 backend，计数仍为 0。释放等待后两条都收到 200。 |
+| ASGI 2.3，首块 `send` 挂起时收到断流 | ASGI 返回时计数为 1、6 页中只有 3 页空闲、下一条请求 429。该次探针强制 GC 并让事件循环执行收尾后恢复 6 页和 200。 |
+| ASGI 2.4，首块 `send` 抛 `BrokenPipeError` | Starlette 抛 `ClientDisconnect`，当时计数为 1，随后异步生成器收尾才回收资源。 |
+| backend 的 `aclose()` 抛 `RuntimeError` | `await event_stream.aclose()` 后面的递减被跳过，计数仍为 1。 |
+
+让检查和占用成为同一段同步操作，发生在 200 发出和后端工作开始之前。用覆盖整个 `StreamingResponse.__call__` 的作用域持有名额。这一层在发送响应头之前就已经进入，也能等 Starlette 的迭代任务退出后关合它的 body。清理需要两个独立的保证，内层尝试 `await body.aclose()`，外层归还这次成功取得的名额。需要屏蔽取消时，只保护有限的清理范围。
+
+### 先找取消落在谁的调用栈上
+
+Starlette 拉取 body 时，body 正在拉取 backend。若此时取消，异常沿这条调用链展开，body 内的 `finally` 有机会运行。Starlette 已获得一个 chunk 并开始 `await send` 时，body 与 backend 都停在各自的 `yield`。异常发生在迭代器消费者里，需由持有 body 的外层显式关合，依次触发 body 关闭 backend，backend 清理未完成的引擎请求。
+
+原实现已经使用 `async for`。这次改的是把 `aclosing` 的退出行为展开成 `try/finally` 和 `await event_stream.aclose()`，两者负责的仍是同一个内层生成器。SSE 可能在首次进入 body 前断开，这种情况下关闭该异步生成器也不会执行它尚未进入的 `finally`。 [Python aclosing](https://docs.python.org/3.12/library/contextlib.html#contextlib.aclosing)
+
+### API 和 Engine 通过后端契约衔接
+
+`create_app` 通过 `ChatBackend` 使用业务接口。服务若要对可预测的拒绝返回 HTTP 422，可在响应头前调用一个后端 `prepare` 接口。具体 backend 渲染 prompt，并复用 Engine 的请求容量检查，让准备结果携带已渲染的 IDs，供实际 stream 提交。后端把可预期拒绝表达为稳定的业务错误，HTTP 层将其映射为状态码。页大小、总页数和当前分配由 Engine 持有。暂时缺少可用页仍由 Engine 调度等待。
+
+### 只在本流队列确实为空时推进 tick
+
+新版第二次 fetch 消除了一个首事件延迟。两个并发请求各拉一次时，探针只执行了一次 tick，两条首事件都能返回。剩下的问题在 `yield` 后面的续跑位置。B 在第二次 fetch 的 `yield` 处暂停，A 独自推进 tick 2 和 3，给 B 积压了两条。B 再拉一条时会从 `yield` 后恢复，先执行 tick 4，再从下一轮取已经排队的事件。统一两个 `yield` 位置，让有事件的路径在交付后回到循环顶部。只有第一次 fetch 缺失才 `sleep(0)`，第二次仍缺失才执行 `step()` 并按 ID 路由。
+
+## 新增回归用例与最新复查
+
+最新实现把流式计数移到 body 入口，加入第二次队列检查并统一到一个 `yield`。在 backend 等待首事件期间会持有名额，取消后能恢复准入。有积压时，由另一条流推进并入队的事件也能全部交付，消费方无需额外推进 tick。已有的 backlog 用例增加了 tick 数不变的断言。
+
+| 覆盖场景 | 结果与待修方向 |
+| --- | --- |
+| chunked prefill 首 tick 无输出 · [测试](../tests/test_lab07_api.py#L568) | 真实 toy Engine 的第一轮仅写 KV。当前分支调用 `step()` 后直接 `queue.get_nowait()`，抛 `QueueEmpty`。 |
+| 当前 tick 只给其它请求出 token · [测试](../tests/test_lab07_api.py#L581) | `max_active=1` 时 B 驱动 A 的终止 tick，B 的队列仍空，也抛 `QueueEmpty`。完成路由后回到循环顶部，让队列状态决定下一步。 |
+| 在响应头或首事件处等待 · [测试](../tests/test_lab07_api.py#L445) | 等首事件时的拒绝、断流后的恢复已通过。发送响应头期间 backend 还未启动，另一个请求仍能通过，因为检查和占用分别处在 endpoint 与 body。让同一段同步逻辑在响应开始前检查并取得名额。 |
+| 发送首个 chunk 中途断流 · [测试](../tests/test_lab07_api.py#L493) | ASGI 2.3 的 `http.disconnect` 和 2.4 的 `BrokenPipeError` 都能复现响应返回时 Engine 仍有工作。测试在响应返回后、下一次挂起或 GC 收尾之前检查请求和页是否释放。 |
+| stream 创建或关闭失败 · [测试](../tests/test_lab07_api.py#L531) | 创建调用发生在 `try` 之前，关闭异常则会跳过后面的名额归还。两种情况下下一条合法请求都得到 429。清理作用域需覆盖创建，且关闭失败时仍归还成功取得的名额。 |
+| 请求永远超出 KV 总容量 · [测试](../tests/test_lab07_api.py#L599) | 新验收将 prompt 与合法输出预算合计超出总容量视为无效输入，沿用 Lab 的 422 契约，同时验证下一条能恰好放下的请求通过。当前普通请求得到 500，SSE 已发出 200。建议通过后端准备接口传递类型明确的拒绝，由 HTTP 层映射状态码。 |
+
+可先修两条 `QueueEmpty`，再一起处理准入和响应退出，最后处理永久容量校验。清理时可顺手删除已经没有调用者的 `_fetch_event`。测试使用本地 toy 权重和原始 ASGI 调用，依靠事件同步把取消落到指定位置。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tests/test_lab07_api.py --tb=short
+```
+
+## stream 空 tick 复验与下一步
+
+内层 `while queue.empty()` 让同一条流可以推进多轮，直到它自己的队列有数据，解决了两条 `QueueEmpty` 回归。当前没有挂起点把退出内层循环和 `get_nowait()` 分开，所以单事件循环下这里的取队列操作安全。
+
+本版漏掉了 `sleep(0)` 之后的第二次检查。A、B 同时等待首事件时，A 恢复后运行 tick 1，把两条首事件都入队。B 恢复时，本地队列已经有数据，但代码直接运行 tick 2，随后才读取 tick 1 已经生成的首事件。新增[并发首事件回归](../tests/test_lab07_api.py#L619)实际观察到 2 个 tick，预期 1 个。保留内层循环并在让步之后重查本流队列，只在仍为空时推进 tick。
+
+下一项练习是 HTTP 流式响应的资源生命周期。请求通过 HTTP 准入时获取名额，覆盖发送响应头、迭代响应体、发送数据和退出清理。当前在 endpoint 检查、在 body 首次运行时占用，响应头发送处的挂起能让第二条请求越过上限。可保持 FastAPI 路由和 Starlette 发送逻辑，把检查及占用合成同步操作，由响应对象的 `__call__` 持有名额。外层应先等待 Starlette 的发送任务退出，再显式 `aclose()` 它的 body。body 自己负责关闭 backend。无论 body 尚未启动、处在 `yield`、创建 backend 抛错或关闭抛错，响应层都要归还成功取得的名额一次。两类资源用各自的清理保证托底。
+
+先验证名额、断流及 backend 异常的六个测试参数，再处理普通与流式请求对永久容量拒绝的两条 422 验收。
+
+## 容量校验复验与扩展流式响应
+
+Backend 让出事件循环后再次确认队列状态，并发两条流只需一个 tick 就能拿到各自首事件。HTTP 入口在发送响应头前调用 `ChatBackend.is_applicable()`，然后把永久超容量映射为 422。Engine 以总页数判断请求能否容纳，调度准入依据当前空闲页数。`Engine.submit()` 复用容量校验。普通与 SSE 的超容量及恰好放下两组边界均通过。
+
+`Protocol` 声明结构契约，实际调用需要每个后端自己提供该成员。测试中正常受理的简易 backend 复用 `AcceptingBackend.is_applicable()` 返回 `(True, "")`。专门验无效 HTTP 输入的替身让 `is_applicable()` 和 `stream()` 都抛断言，保证无效 payload 在 HTTP 层就被拦住。用真实 Engine 的容量用例继续验证实际计算。当前成功请求会在 `is_applicable` 和 `stream` 各调用一次 `_build_request`，重复渲染 prompt 及生成内部 ID。可在响应清理完成后再考虑复用一次准备的结果。
+
+FastAPI 的路由返回一个 `Response` 实例，随后通过 `await response(scope, receive, send)` 执行它。继承 `StreamingResponse` 并覆盖异步 `__call__`，就能在项目里扩展此调用。调用 `await super().__call__(scope, receive, send)` 复用 Starlette 的响应头、迭代、发送和断流逻辑。也可以让一个继承 `Response` 的包装类持有原版 `StreamingResponse`，在自己的 `__call__` 内调用它。普通可调用对象直接从路由返回时可能会被 FastAPI 当作数据序列化。 [FastAPI 直接返回 Response](https://fastapi.tiangolo.com/advanced/response-directly/#return-a-response)
+
+建议先用子类。在调用父类前原子检查并占用名额，超限时直接发送 429。保存明确可关闭的 body 生成器，让 `aclosing(body)` 包住父类调用。外一层 `finally` 归还已取得的 HTTP 名额。body 本身负责关闭 backend。这样响应头发送中断、body 挂在 `yield` 时断流、backend 创建抛错和关闭抛错，都由覆盖相应边界的清理路径处理。响应关合后再归还名额，名额的归还仍会在关合抛错时执行。
+
+本轮五项失败分别是发送响应头时的超额准入、发送首块时的两种 ASGI 断流，以及 backend 打开和关闭异常。用下列命令可聚焦响应生命周期的六个参数化用例，其中等首事件的准入已通过。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tests/test_lab07_api.py \
+  -k 'holds_admission or during_send or failure_restores'
+```
+
+## 父类退出后关闭 body 与最新复验
+
+原验收 Lab 01～07 共 `59 passed, 1 skipped`，跳过的是需要本地 Qwen3 快照的可选测试。当前子类在调用 Starlette 之前检查并占用名额，保存传给父类迭代的同一个 `body()` 生成器，并在父类调用退出后显式关闭它。上一轮的响应头准入、首块断流和 backend 打开或关闭故障测试都通过。
+
+### 首块发送时断流的模拟
+
+用真实 toy Engine、总计 6 个 KV 页、每页 2 token，输入 2 个 prompt token，`max_tokens=4`。在原始 ASGI 调用中，于首块进入 `send` 时制造断流。
+
+| 时刻 | 观察与解释 |
+| --- | --- |
+| 子类开始调用父类 | 已取得名额，Starlette 发送响应头。首轮迭代进入 body，body 拉取 backend，backend 提交请求。 |
+| 首个 tick | 预留 5 个 KV token 的空间，占 3 页，剩余 3 页。prefill 产生首个 token，`finish_reason=None`。 |
+| 首块进入 `send` | Backend 暂停在 `yield event`，body 暂停在 `yield SSE 字符串`，Starlette 正在消费者的 `await send`。 |
+| 父类调用退出 | 本地 Starlette 在 ASGI 2.3 分支收到 `http.disconnect` 并取消发送任务，再等任务组退出。在 2.4 分支，探针让 `send` 抛 `BrokenPipeError`，父类转换为 `ClientDisconnect`。日志均先观察到父类退出。 |
+| 子类显式等待 `body.aclose()` | Python 在 body 挂起的 `yield` 处注入 `GeneratorExit`，body 的 `finally` 关闭 backend。Backend 在自己的挂起点清理，因为请求尚未完成而执行 `Engine.cancel`。日志此时记录页数回到 6。 |
+| 整个 ASGI 调用退出 | Engine 无工作、backend 状态表为空。下一条请求返回 200。 |
+
+`async for` 取到值后会先执行循环体，再决定是否拉下一项。异常若出现在循环体内的 `send`，生成器处于挂起状态，消费者退出并不会沿着那两个 `yield` 执行生成器清理。等待父类调用退出后，父类已停止拉取迭代器，此时关闭由子类持有的生成器。若取消发生在正等待下一条事件时，取消会沿当前的等待链进入 body 和 backend，它们通常已经开始清理。若发响应头时就断开，body 还未启动，`aclose()` 不会运行 body 的函数体。正常迭代耗尽后再关合也是空操作。 [Python 异步生成器](https://docs.python.org/3.12/reference/expressions.html#asynchronous-generator-iterator-methods) · [ASGI 断流规范](https://asgi.readthedocs.io/en/latest/specs/www.html#disconnected-client-send-exception)
+
+### 两个新增的计数回归
+
+- **普通请求连续遭拒。** [api.py](../src/tinyserve/api.py#L317) 中 `try` 覆盖了获取名额，第二个请求的 `429` 会经过 `finally`，误减第一个请求的名额。保持第一个请求挂起时，第三条请求实测返回 200，预期仍为 429。让成功获取先于负责归还的 `try`。[普通请求回归](../tests/test_lab07_api.py#L132)
+- **首块断流且显式关闭抛错。** [api.py](../src/tinyserve/api.py#L308) 中 `await body.aclose()` 与归还名额顺序放在同一个 `finally`。当 backend 的清理在这次显式关闭中抛错，名额归还被跳过，下一条请求实测返回 429。让尝试关闭与归还名额分别有自己的清理保证，最外层 `finally` 归还名额。先前的关闭失败用例走的是正常迭代末尾，抛错时 body 已经退出，所以子类随后显式关闭时没有再抛。[断流与关闭异常回归](../tests/test_lab07_api.py#L647)
+
+最终复验中，普通请求先取得名额，再进入负责归还的 `try/finally`。SSE 响应用 `aclosing(body)` 包住 Starlette 的调用，并从外层 `finally` 归还名额。前者让 429 短路退出时保持计数，后者让关闭异常传播时仍能执行归还。两条新增回归已通过。 [普通响应分支](../src/tinyserve/api.py#L314) · [SSE 响应分支](../src/tinyserve/api.py#L303)
+
+## 从 Lab 07 到 Lab 08
+
+先实现 [bench.py](../src/tinyserve/bench.py) 的 `summarize`，用 [fake-clock 验收](../tests/test_lab08_bench.py) 读清分位数，再实现 `run_trace`。引擎内 TTFT 从实际 `submit` 到第一个 `TokenEvent` 被观测，ITL 只取同一请求相邻两个 token 的时间差，吞吐用总输出 token 数除以最早提交到最晚完成的时间。每个 tick 执行期间抵达的请求在 tick 之后提交。没有样本时分位数为 `None`，最近秩用排序后的位置 `ceil(p * n)`（从 1 开始）。在线接口另外观察首个 SSE 帧或首个非空文本，报告时明确起点和终点。200 响应头、空 delta、首个非空文本可能出现在不同时间。

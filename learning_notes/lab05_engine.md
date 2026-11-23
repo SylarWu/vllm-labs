@@ -166,7 +166,7 @@ Engine 需要维护 `request_id → BlockTable/PagedKV` 的映射，只在准入
 
 - **等待请求取消**：尚未持有页，只从 Scheduler 移除，不应误释放其他资源。
 - **活跃请求取消**：释放对应 `BlockTable`，删除资源映射。
-- **EOS 或长度完成**：Scheduler 的 `on_retire` 回调触发相同释放路径。
+- **EOS 或长度完成**：Scheduler 的 `_on_retire` 回调触发相同释放路径。
 - **重复结束或重复取消**：不能重复归还同一批页。
 
 可以让退休与取消统一经过一个幂等的有资源释放路径：只有确实存在该请求的资源记录时才执行 `release()`。`BlockTable.release()` 本身已幂等，但 Engine 的资源字典也应及时清理，避免元数据泄漏和把旧视图误交给同 ID 的新请求。
@@ -181,7 +181,7 @@ Lab 05 中每个 `Step` 都会发出一个 token：
 4. 调用 `model(input_ids, cache=paged_kv, start_pos=step.start_pos)`。
 5. 取 `logits[:, -1, :]`，沿词表维 `argmax` 得到下一个 token ID。
 6. 调用 `scheduler.complete(step, sampled_token)`，由 Scheduler 推进输入位置、输出计数并生成 `TokenEvent`。
-7. 若请求结束，`on_retire` 在 `complete` 内同步释放页；否则下一轮会把刚采样的 token 作为 decode 输入。
+7. 若请求结束，`_on_retire` 在 `complete` 内同步释放页；否则下一轮会把刚采样的 token 作为 decode 输入。
 8. 收集本轮事件并返回；没有计划步骤时返回空列表。
 
 注意时序：本次 forward 只把**本次输入 token**的 K/V 写入 cache；本次 logits 采样出的 token 要等下一次 forward 才会产生自己的 K/V。这与容量公式中的 `-1` 是同一个事实。

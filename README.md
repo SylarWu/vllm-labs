@@ -62,7 +62,7 @@ python -m pytest -q tests/test_lab01_model.py
 
 **先读** [Orca 论文](https://www.usenix.org/conference/osdi22/presentation/yu) 的 iteration-level scheduling。先用 fake logits 建立调度时序，然后连接模型。
 
-**实现** `scheduler.py`。每个 tick 先按 FIFO 接纳，队首准入失败时保留次序。`plan()` 给每个活跃请求至多一个 `Step`，调用者在下一次 `plan()` 前完成当前迭代的全部 `complete()`。第一版的 prefill 吃完整 prompt 且发首 token，decode 消费上一步生成的 token。EOS 优先于长度上限。等待或活跃请求均可在 tick 边界取消，终止时触发一次 `on_retire`。`try_admit` 返回 False 时请求继续等待。
+**实现** `scheduler.py`。每个 tick 先按 FIFO 接纳，队首准入失败时保留次序。`plan()` 给每个活跃请求至多一个 `Step`，调用者在下一次 `plan()` 前完成当前迭代的全部 `complete()`。第一版的 prefill 吃完整 prompt 且发首 token，decode 消费上一步生成的 token。EOS 优先于长度上限。等待或活跃请求均可在 tick 边界取消，终止时触发一次 `_on_retire`。`try_admit` 返回 False 时请求继续等待。
 
 **验收** A 长请求在 decode 时，B 能加入并结束，C 能接续占用空位。验证 EOS 和输出上限同 tick 的行为，等待态及运行态的取消，非法输入、重复活跃 ID 和队首阻塞后的再次尝试。阅读 nano-vLLM 的 `engine/scheduler.py` 可以用同一条 trace 对照。
 

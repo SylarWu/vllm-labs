@@ -295,6 +295,10 @@ async def body():
 
 Uvicorn 是运行 ASGI app 的服务器。HTTPX 的 `ASGITransport` 则直接调用 app，不经过真实 socket，适合接口测试，但会缓冲流式响应，不能单独证明客户端中途断开的处理正确。因此项目还使用原始 ASGI 测试主动注入 `http.disconnect`。
 
+ASGI 全称 Asynchronous Server Gateway Interface。它规定 Python 应用和协议服务器之间的接口。HTTP 的一次请求对应一次 `app(scope, receive, send)` 调用，长连接上的多次请求有各自的 scope。客户端发送和接收 HTTP 字节，Uvicorn 在字节与 ASGI 消息字典之间转换，FastAPI 负责路由，Starlette 的 `StreamingResponse` 负责迭代和发送 body。SSE 的 `data: ...\n\n` 只是 `http.response.body` 所携带的字节的一部分。 [ASGI 总规范](https://asgi.readthedocs.io/en/latest/specs/main.html) · [HTTP 消息规范](https://asgi.readthedocs.io/en/latest/specs/www.html)
+
+`scope["asgi"]["version"]` 是 ASGI 接口版本，`spec_version` 是 HTTP 子规范版本。本地 Starlette 1.10.0 在小于 2.4 的分支并行监听 `receive()` 和发送响应，收到 `http.disconnect` 后取消流式任务。2.4 起的分支依靠已断连接上的 `send()` 抛出 `OSError`，再转成 `ClientDisconnect`。原始 ASGI 探针只需控制 `receive` 和 `send`，就能确定性地把取消放在等待下一条生成事件、发送响应头或发送首块的位置。 [ASGI 版本与断流规范](https://asgi.readthedocs.io/en/latest/specs/www.html#spec-versions)
+
 ## 9. 阅读本项目测试时的语法对照
 
 ```python
@@ -373,6 +377,22 @@ async with lock:
 `asyncio.Lock` 只协调事件循环中的 coroutine，不是跨线程锁。若引入 `to_thread` 或独立 worker thread，应重新设计 Engine owner 和线程间通信，而不是沿用单事件循环结论。
 
 不必要的锁还会带来 async 染色：原本同步的 dict 辅助函数为了获取锁变成 async，所有调用方被迫 await，于是出现更多交错点。优先减少共享状态和临界区，再考虑增加锁。
+
+## 13. 在 Lab 07 判断代码何时真正执行
+
+| 写法 | 当下发生的事 |
+| --- | --- |
+| 定义 `async def normal_chat_completion(...)` | 创建函数。调用后得到 coroutine 对象，`await` 才进入函数体。本项目由 endpoint 的同一个 Task 驱动。 |
+| 调用含 `yield` 的 `body()` 或 `backend.stream(request)` | 创建异步生成器。第一次 `await anext(gen)` 或 `async for` 才推进函数体。 |
+| `def stream(...) -> AsyncGenerator[ChatEvent, None]`（Protocol） | 返回类型是静态契约，调用者应直接拿到可迭代对象。实现里的 `async def` 加 `yield` 满足该契约。 |
+| `async for event in event_stream` | 每轮等待 `__anext__()`，收到一个值就执行循环体，收到 `StopAsyncIteration` 就结束。 |
+| `async with aclosing(gen)` | 等待进入和退出方法。进入时返回生成器，退出时等待 `gen.aclose()`。 |
+| `yield event` | 把值交给正在拉取它的消费者。生成器在此挂起，下一次拉取或显式关闭才继续处理该挂起点。这个交接可以全在同一个 Task 内发生。 |
+| `await asyncio.sleep(0)` | 一定挂起当前 Task 一次，给事件循环机会调度其他任务。 |
+| `await send(...)` | 等待 ASGI 发送。底层遇到背压时可以挂起。awaitable 如果立即完成，这里可以连续执行。 |
+| `engine.step()`、`queue.put_nowait(...)`、`json.dumps(...)` | 在当前 Task 的同步执行段中立即运行。同一事件循环上的其它任务要等到当前 Task 真正挂起后才有机会执行。 |
+
+退出 `async for` 的循环体与关合异步生成器是两件事。若异常发生在消费者处理刚拿到的值时，例如 Starlette 在 `await send` 期间断流，生成器仍停在它的 `yield`。由持有迭代器的消费方显式等待 `aclose()`，可以把回收完成时间绑定到本次响应退出。若生成器从未被进入，关合也不会运行其函数体内的 `finally`，因此在生成器外先取得的资源要由外层负责。 [Python 异步生成器](https://docs.python.org/3.12/reference/expressions.html#asynchronous-generator-functions) · [asyncio 协程与任务](https://docs.python.org/3.12/library/asyncio-task.html)
 
 ## 与 Lab 07 的最小关系图
 

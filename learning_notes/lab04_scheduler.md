@@ -64,7 +64,7 @@ Lab 04 的每个 `Step` 都发 token，因此 `sampled_token=None` 是非法结�
 
 - `complete` 先记录并发出本轮 token，再决定是否终止。如果同一个 token 同时命中 EOS 和预算上限，事件的 `finish_reason` 为 `stop`。只达到预算时为 `length`。正常完成应移除活跃请求，并触发一次 `on_retire(request_id)`。
 - `cancel(request_id)` 在轮次边界执行，等待或活跃请求都可移除，成功返回 `True`。找不到该 ID 返回 `False`，也就不会重复回调。取消没有本轮新 token，接口只返回布尔值。
-- 严格 FIFO 允许产生队首阻塞。若队尾请求能获准但队首暂时不行，继续保持原顺序，下一轮重试。Lab 05 将通过 `try_admit` 判断是否有足够的 KV 块，通过 `on_retire` 释放请求资源。[Lab 03](lab03_paging.md)
+- 严格 FIFO 允许产生队首阻塞。若队尾请求能获准但队首暂时不行，继续保持原顺序，下一轮重试。Lab 05 将通过 `try_admit` 判断是否有足够的 KV 块，通过 `_on_retire` 释放请求资源。[Lab 03](lab03_paging.md)
 
 ## 动手与验收
 

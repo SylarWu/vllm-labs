@@ -7,10 +7,11 @@ import uuid
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
-from typing import Literal, Protocol, AsyncIterable
+from typing import Literal, Protocol
 
 import fastapi.responses
 from fastapi import FastAPI, Body, HTTPException
+from starlette.types import Scope, Receive, Send
 
 from tinyserve.engine import Engine
 from tinyserve.requests import FinishReason, Request, TokenEvent
@@ -38,6 +39,9 @@ class ChatBackend(Protocol):
     model: str
 
     def stream(self, request: ChatRequest) -> AsyncGenerator[ChatEvent, None]:
+        ...
+
+    def is_applicable(self, request: ChatRequest) -> tuple[bool, str]:
         ...
 
 
@@ -125,6 +129,17 @@ class EngineChatBackend:
             eos_token_id=self.eos_token_id
         )
 
+    def _fetch_event(self, queue: asyncio.Queue[ChatEvent]) -> ChatEvent | None:
+        if queue.empty():
+            return None
+        else:
+            return queue.get_nowait()
+
+    def is_applicable(self, request: ChatRequest) -> tuple[bool, str]:
+        req = self._build_request(request)
+
+        return self.engine.is_applicable(req)
+
     async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatEvent, None]:
 
         req = self._build_request(request)
@@ -135,22 +150,20 @@ class EngineChatBackend:
             self.engine.submit(req)
 
             while True:
-                if not queue.empty():
-
-                    event = queue.get_nowait()
-
-                    yield event
-
-                    if event.finish_reason:
-                        return
-                else:
-                    # wait instant multiple request to batch
+                while queue.empty():
                     await asyncio.sleep(0)
-
+                    if not queue.empty():
+                        break
                     token_events = self.engine.step()
-
                     for e in token_events:
                         self._prepare_token_event(e.request_id, e)
+
+                event = queue.get_nowait()
+
+                yield event
+                if event.finish_reason:
+                    return
+
         finally:
             _, state = self._destroy_running_state(req.request_id)
             if state and not state["finished"]:
@@ -209,18 +222,15 @@ def create_app(
         if not (stream is not None and isinstance(stream, bool)):
             raise HTTPException(422, f"Invalid stream!: Stream {stream}")
 
-        # inflight check
-        nonlocal inflight
-        if inflight >= max_inflight:
-            raise HTTPException(429, "Too Many Requests!")
-
-        inflight = inflight + 1
-
         req_id = "chatcmpl-" + str(uuid.uuid4().hex)
         req = ChatRequest(
             messages=(*messages,), max_tokens=max_tokens
         )
         req_created = int(time.time())
+
+        allow, reason = backend.is_applicable(req)
+        if not allow:
+            raise HTTPException(422, f"{reason}")
 
         async def normal_chat_completion(id: str, request: ChatRequest, created: int) -> fastapi.responses.JSONResponse:
             content = ""
@@ -249,41 +259,66 @@ def create_app(
                 ]
             }, 200)
 
-        def stream_chat_completion(id: str, request: ChatRequest, created: int) -> fastapi.responses.StreamingResponse:
-            async def body() -> AsyncIterable[str]:
-                try:
-                    async with aclosing(backend.stream(request)) as event_stream:
-                        async for event in event_stream:
-                            yield "data: " + json.dumps({
-                                "id": id,
-                                "object": "chat.completion.chunk",
-                                "model": backend.model,
-                                "created": created,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {
-                                            "content": event.delta
-                                        },
-                                        "finish_reason": event.finish_reason,
-                                    }
-                                ]
-                            }) + "\n\n"
-                            if event.finish_reason:
-                                yield "data: [DONE]\n\n"
-                                return
-                finally:
-                    nonlocal inflight
-                    inflight = inflight - 1
+        def inflight_check_and_add():
+            nonlocal inflight
+            if inflight >= max_inflight:
+                raise HTTPException(429, "Too Many Requests!")
+            inflight = inflight + 1
 
-            return fastapi.responses.StreamingResponse(body(), status_code=200, media_type="text/event-stream")
+        def inflight_release():
+            nonlocal inflight
+            inflight = inflight - 1
+
+        def stream_chat_completion(id: str, request: ChatRequest, created: int) -> fastapi.responses.StreamingResponse:
+            async def body() -> AsyncGenerator[str]:
+                event_stream = backend.stream(request)
+                try:
+                    async for event in event_stream:
+                        yield "data: " + json.dumps({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "model": backend.model,
+                            "created": created,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "content": event.delta
+                                    },
+                                    "finish_reason": event.finish_reason,
+                                }
+                            ]
+                        }) + "\n\n"
+                        if event.finish_reason:
+                            yield "data: [DONE]\n\n"
+                            return
+                finally:
+                    await event_stream.aclose()
+
+            class SimpleStreamingResponse(fastapi.responses.StreamingResponse):
+                def __init__(self, content: AsyncGenerator[str], status_code: int, media_type: str):
+                    super().__init__(content, status_code=status_code, media_type=media_type)
+                    self.async_generator = content
+
+                async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                    nonlocal inflight
+                    inflight_check_and_add()
+                    try:
+                        async with aclosing(self.async_generator):
+                            await super().__call__(scope, receive, send)
+                    finally:
+                        inflight_release()
+
+            return SimpleStreamingResponse(body(), status_code=200, media_type="text/event-stream")
 
         if stream:
             return stream_chat_completion(req_id, req, req_created)
         else:
+            nonlocal inflight
+            inflight_check_and_add()
             try:
                 return await normal_chat_completion(req_id, req, req_created)
             finally:
-                inflight = inflight - 1
+                inflight_release()
 
     return app
