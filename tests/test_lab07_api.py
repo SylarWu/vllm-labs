@@ -324,3 +324,50 @@ def test_engine_backend_task_cancellation_cleans_up_and_propagates():
         assert backend.running_state == {}
 
     asyncio.run(run())
+
+
+def test_engine_backend_backlogged_events_keep_their_own_deltas():
+    class BacklogEngine:
+        def __init__(self):
+            self.ids = {}
+            self.steps = 0
+
+        def submit(self, request):
+            self.ids[request.prompt_ids[0]] = request.request_id
+
+        def step(self):
+            self.steps += 1
+            a_id = self.ids.get(ord("A"))
+            b_id = self.ids[ord("B")]
+            if self.steps == 1:
+                return [TokenEvent(b_id, ord("B"))]
+            if self.steps == 2:
+                return [
+                    TokenEvent(a_id, ord("A")),
+                    TokenEvent(b_id, ord("B")),
+                ]
+            return [
+                TokenEvent(a_id, ord("A")),
+                TokenEvent(b_id, ord("B"), "length"),
+            ]
+
+        def cancel(self, request_id):
+            return False
+
+    async def run():
+        backend = EngineChatBackend(BacklogEngine(), ToyTokenizer(), model="toy")
+        stream_b = backend.stream(ChatRequest((Message("user", "B"),), 3))
+        assert (await anext(stream_b)).delta == "B"
+
+        stream_a = backend.stream(ChatRequest((Message("user", "A"),), 2))
+        assert (await anext(stream_a)).delta == "A"
+        assert (await anext(stream_a)).delta == "A"
+
+        second_b = await anext(stream_b)
+        final_b = await anext(stream_b)
+        assert second_b.delta == "B" and second_b.finish_reason is None
+        assert final_b.delta == "B" and final_b.finish_reason == "length"
+        await stream_a.aclose()
+        await stream_b.aclose()
+
+    asyncio.run(run())

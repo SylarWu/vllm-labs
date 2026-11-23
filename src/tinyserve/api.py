@@ -65,22 +65,21 @@ class EngineChatBackend:
 
         self.eos_token_id = eos_token_id
 
-        self.event_queue: dict[str, asyncio.Queue[TokenEvent]] = dict()
+        self.event_queue: dict[str, asyncio.Queue[ChatEvent]] = dict()
         self.running_state: dict[str, dict] = dict()
 
-    def _init_running_state(self, request_id: str) -> (asyncio.Queue[ChatEvent], dict):
+    def _init_running_state(self, request_id: str) -> tuple[asyncio.Queue[ChatEvent], dict]:
         if request_id not in self.running_state:
             self.running_state[request_id] = {
                 "token_ids": [],
-                "stable_text": "",
-                "emitted_text": "",
+                "queued_text": "",
                 "finished": False,
             }
             self.event_queue[request_id] = asyncio.Queue()
 
         return self.event_queue[request_id], self.running_state[request_id]
 
-    def _destroy_running_state(self, request_id: str) -> (asyncio.Queue[dict] | None, dict | None):
+    def _destroy_running_state(self, request_id: str) -> tuple[asyncio.Queue[ChatEvent] | None, dict | None]:
         return self.event_queue.pop(request_id, None), self.running_state.pop(request_id, None)
 
     def _prepare_token_event(self, request_id: str, event: TokenEvent):
@@ -89,28 +88,32 @@ class EngineChatBackend:
         queue, state = self._init_running_state(request_id)
 
         state["token_ids"].append(event.token_id)
-        state["finished"] = event.finish_reason is not None
+        if not state["finished"] and event.finish_reason:
+            state["finished"] = True
 
-        text = self.tokenizer.decode(state["token_ids"])
-        if len(text) >= 1:
-            i = len(text) - 1
-            while i >= 0 and text[i] == '�':
-                i = i - 1
-            if i >= 0:
-                state["stable_text"] = text[:i + 1]
-
-        queue.put_nowait(event)
-
-    def _get_ready_delta(self, request_id: str) -> str:
-        queue, state = self._init_running_state(request_id)
-
-        stable_text = state["stable_text"]
-        if stable_text == "":
+        def get_current_stable_text(token_ids: list[int]) -> str:
+            text = self.tokenizer.decode(token_ids)
+            if len(text) >= 1:
+                i = len(text) - 1
+                while i >= 0 and text[i] == '�':
+                    i = i - 1
+                if i >= 0:
+                    return text[:i + 1]
             return ""
+
+        stable_text = get_current_stable_text(state["token_ids"])
+
+        delta = ""
+        if stable_text == "":
+            delta = ""
         else:
-            emitted_text = state["emitted_text"]
-            state["emitted_text"] = stable_text
-            return stable_text[len(emitted_text):]
+            delta = stable_text[len(state["queued_text"]):]
+            state["queued_text"] = stable_text
+
+        queue.put_nowait(ChatEvent(
+            delta=delta,
+            finish_reason=event.finish_reason,
+        ))
 
     def _build_request(self, c_req: ChatRequest) -> Request:
         return Request(
@@ -134,10 +137,7 @@ class EngineChatBackend:
 
                     event = queue.get_nowait()
 
-                    yield ChatEvent(
-                        delta=self._get_ready_delta(req.request_id),
-                        finish_reason=event.finish_reason,
-                    )
+                    yield event
 
                     if event.finish_reason:
                         return
@@ -150,8 +150,8 @@ class EngineChatBackend:
                     for e in token_events:
                         self._prepare_token_event(e.request_id, e)
         finally:
-            queue, state = self._destroy_running_state(req.request_id)
-            if not state["finished"]:
+            _, state = self._destroy_running_state(req.request_id)
+            if state and not state["finished"]:
                 self.engine.cancel(req.request_id)
 
 

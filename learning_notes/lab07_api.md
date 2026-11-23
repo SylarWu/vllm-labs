@@ -1,6 +1,6 @@
 # Lab 07 · 流式服务与取消
 
-**状态：进行中，已完成知识导入，尚未开始实现。** Lab 07 当前 `5 failed`，失败原因均为 `api.py` 中的学生入口尚未实现；Lab 01～06 回归为 `38 passed, 1 skipped`。
+**状态：进行中，EngineChatBackend 已完成当前验收。** Backend 的并发路由、提前关闭、任务取消、UTF-8 稳定前缀、peer 终止事件交付和积压 delta 测试合计 `5 passed`；`create_app` 的普通响应、参数校验、SSE 和断流测试尚未实现。Lab 01～06 回归基线为 `38 passed, 1 skipped`。
 
 异步语法与 `asyncio`、ASGI 工具包的基础解释见 [Python 异步语法与工具包](python_async.md)。
 
@@ -488,3 +488,56 @@ e3 路由后得到“你A”，stable_text="你A"
 一种整理方向是在路由时就把 TokenEvent 转为待交付 ChatEvent：使用“已入队稳定文本”游标计算本事件自己的 delta，再把 ChatEvent 放入 Queue。消费者只负责 yield，不再读取更晚事件的 stable_text。另一种方向是在消费时按事件对应的 token 前缀逐个 decode。若决定允许合并帧，则应明确合并规则并相应调整逐事件测试，而不是让调度偶然决定合并。
 
 此外，Queue 无界时，慢消费者的待交付事件可能持续增长。本 lab 的 max_tokens 会限制单请求规模，因此不是当前阻塞问题；生产系统还需背压或集中 driver 策略。累计 IDs 每次从头 decode 的总工作量也可能随输出长度呈平方级增长，这是后续增量 detokenizer 的优化点。
+
+## 积压问题的职责拆分：不需要 Queue.peek
+
+第五次重构将 Queue 独立为 event_queue dict，但 Queue 中仍是 TokenEvent，消费时仍读取最新 stable_text，因此尚未改变 delta 归属时机。原有四项测试继续通过。
+
+这里应拆成三个独立问题：
+
+1. Unicode 完整性：累计 decode 后暂时保留末尾 U+FFFD；
+2. 事件 delta 归属：在事件入队时记录它自己的稳定文本增量；
+3. 待交付传输：Queue 保存已经构造完整的 ChatEvent，或 TokenEvent 与文本快照。
+
+Queue.peek 只能观察队首，无法恢复每个历史事件入队时的 stable_text。问题不在 Queue 缺少查询能力，而在入队时丢掉了时间快照。
+
+### 入队时计算 delta
+
+每请求除 emitted_text 外，可概念上维护 queued_text：表示已经分配给 Queue 中事件的稳定文本。每个 TokenEvent 到达时：
+
+```text
+更新累计 token IDs
+计算最新 stable_text
+校验 stable_text 以 queued_text 为前缀
+本事件 delta = stable_text 去掉 queued_text 前缀
+queued_text = stable_text
+Queue.put_nowait(ChatEvent(delta, event.finish_reason))
+```
+
+消费者只需 get_nowait 后原样 yield。即使事件积压，后续消费也不会重新解释旧事件。emitted_text 不再需要兼任 delta 计算游标。
+
+UTF-8 仍由原累计 decode 规则处理：
+
+```text
+e1 stable=""    → 入队 delta=""
+e2 stable="你"  → 入队 delta="你"
+e3 stable="你A" → 入队 delta="A"
+```
+
+无论消费者何时恢复，三个事件的内容都固定。不需要 tokenizer 额外提供“是否完整 Unicode”查询，也不需要 Queue.peek。
+
+新增 `test_engine_backend_backlogged_events_keep_their_own_deltas` 固定让 B 的第二、第三事件在 B 暂停时依次入队，再恢复 B，要求二者各自携带自己的 B，而不是第二个事件携带 BB、最终事件为空。
+
+### 本次重构的其他观察
+
+- event_queue 与 running_state 两个 dict 必须始终同步创建和删除；将 Queue 放回每请求状态或使用 typed RequestState 更容易维护该不变量。
+- event_queue 声明为 Queue[TokenEvent]，但 `_init_running_state` 返回注解写成 Queue[ChatEvent]，二者目前不一致；`_destroy_running_state` 的 Queue[dict] 也不是实际元素类型。
+- `state["finished"] = event.finish_reason is not None` 会让迟到普通事件把 True 重置为 False。正常序列不会这样，但状态语义更适合只在收到终止事件时从 False 转为 True。
+
+## EngineChatBackend 当前验收结论
+
+最新复验为 `5 passed, 4 deselected`。Queue[ChatEvent] 与 queued_text 已将 delta 固定在事件入队时，新增积压测试通过；任务取消仍传播 CancelledError，提前关闭和正常结束的资源路径均保持通过。
+
+Backend 可以进入 HTTP 集成阶段。finished 已改为只在终止时单向置 True，冗余 stable_text 已删除，返回值和 token_ids 类型注解已规范化，finally 已处理 state=None。整理后复验仍为 `5 passed`。
+
+最终 yield 后是否恢复仍由消费者决定，create_app 必须保证关闭 backend stream。

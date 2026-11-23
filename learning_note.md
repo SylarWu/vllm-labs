@@ -12,7 +12,7 @@
 | 04 | 迭代级调度 | 已完成，`5 passed`；Lab 01～04 回归 `20 passed, 1 skipped`，准入、取消和退休边界已复验 | [Lab 04](learning_notes/lab04_scheduler.md) |
 | 05 | 分页 KV 与端到端 Engine | 已完成，`3 passed`；Lab 01～05 回归 `23 passed, 1 skipped`，PagedKV 跨 tick 生命周期已复验 | [Lab 05](learning_notes/lab05_engine.md) |
 | 06 | 真 batch decode 与 chunked prefill | 已完成，`15 passed`；Lab 01～06 回归 `38 passed, 1 skipped`，混合 batch、事件契约与 KV 生命周期已复验 | [Lab 06](learning_notes/lab06_batch.md) |
-| 07 | FastAPI、SSE 与取消 | 进行中，已完成知识导入；当前 5 条验收测试待实现 | [Lab 07](learning_notes/lab07_api.md) |
+| 07 | FastAPI、SSE 与取消 | 进行中；EngineChatBackend `5 passed`，HTTP/SSE 与 ASGI 断流部分待实现 | [Lab 07](learning_notes/lab07_api.md) |
 | 08 | 指标、压测与官方 vLLM 对照 | 未开始 | 待创建 |
 
 ## 通用资料
