@@ -205,3 +205,122 @@ def test_engine_backend_routes_concurrent_rows_and_cancels_early_close():
         await stream.aclose()
         assert len(engine.cancelled) == 1 and engine.active == {}
     asyncio.run(run())
+
+
+def test_engine_backend_holds_incomplete_utf8_until_the_stable_prefix_grows():
+    class SplitUtf8Tokenizer:
+        pieces = {1: b"\xe4", 2: b"\xbd", 3: b"\xa0", 4: b"A"}
+
+        def render(self, messages):
+            return (0,)
+
+        def decode(self, token_ids):
+            return b"".join(self.pieces[token] for token in token_ids).decode(
+                "utf-8", errors="replace"
+            )
+
+    class SplitUtf8Engine:
+        def __init__(self):
+            self.active = {}
+
+        def submit(self, request):
+            self.active[request.request_id] = 0
+
+        def step(self):
+            events = []
+            for request_id, index in list(self.active.items()):
+                token_id = index + 1
+                self.active[request_id] = index + 1
+                reason = "length" if token_id == 4 else None
+                events.append(TokenEvent(request_id, token_id, reason))
+                if reason:
+                    del self.active[request_id]
+            return events
+
+        def cancel(self, request_id):
+            return self.active.pop(request_id, None) is not None
+
+    async def run():
+        backend = EngineChatBackend(
+            SplitUtf8Engine(), SplitUtf8Tokenizer(), model="toy"
+        )
+        request = ChatRequest((Message("user", "ignored"),), 4)
+        events = [event async for event in backend.stream(request)]
+        assert [event.delta for event in events] == ["", "", "你", "A"]
+        assert "".join(event.delta for event in events) == "你A"
+        assert events[-1].finish_reason == "length"
+
+    asyncio.run(run())
+
+
+def test_engine_backend_delivers_terminal_event_routed_by_a_peer_stream():
+    class PeerEngine:
+        def __init__(self):
+            self.ids = {}
+            self.steps = 0
+
+        def submit(self, request):
+            self.ids[request.prompt_ids[0]] = request.request_id
+
+        def step(self):
+            self.steps += 1
+            if self.steps == 1:
+                return [TokenEvent(self.ids[ord("B")], ord("B"))]
+            return [
+                TokenEvent(self.ids[ord("A")], ord("A")),
+                TokenEvent(self.ids[ord("B")], ord("B"), "length"),
+            ]
+
+        def cancel(self, request_id):
+            return False
+
+    async def run():
+        backend = EngineChatBackend(PeerEngine(), ToyTokenizer(), model="toy")
+        stream_b = backend.stream(ChatRequest((Message("user", "B"),), 2))
+        assert (await anext(stream_b)).delta == "B"
+
+        stream_a = backend.stream(ChatRequest((Message("user", "A"),), 2))
+        assert (await anext(stream_a)).delta == "A"
+
+        final_b = await anext(stream_b)
+        assert final_b.delta == "B" and final_b.finish_reason == "length"
+        await stream_a.aclose()
+
+    asyncio.run(run())
+
+
+def test_engine_backend_task_cancellation_cleans_up_and_propagates():
+    class IdleEngine:
+        def __init__(self):
+            self.active = {}
+            self.cancelled = []
+
+        def submit(self, request):
+            self.active[request.request_id] = request
+
+        def step(self):
+            return []
+
+        def cancel(self, request_id):
+            self.cancelled.append(request_id)
+            return self.active.pop(request_id, None) is not None
+
+    async def run():
+        engine = IdleEngine()
+        backend = EngineChatBackend(engine, ToyTokenizer(), model="toy")
+        stream = backend.stream(ChatRequest((Message("user", "A"),), 2))
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+
+        pending.cancel()
+        try:
+            await pending
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("stream swallowed task cancellation")
+
+        assert len(engine.cancelled) == 1 and engine.active == {}
+        assert backend.running_state == {}
+
+    asyncio.run(run())
