@@ -76,3 +76,105 @@ def test_replay_observes_arrivals_and_sleeps_during_idle_time():
     assert result["b"].completed_s == pytest.approx(10.03)
     assert result["c"].emitted_s == pytest.approx((10.11,))
     assert clock.waits == pytest.approx([0.07])
+
+
+def test_replay_records_zero_valued_token_ids():
+    class FakeClock:
+        now = 4.0
+
+        def read(self):
+            return self.now
+
+    clock = FakeClock()
+
+    class Engine:
+        active = False
+
+        @property
+        def has_work(self):
+            return self.active
+
+        def submit(self, request):
+            self.active = True
+
+        def step(self):
+            self.active = False
+            clock.now += 0.01
+            return [TokenEvent("zero", 0, "length")]
+
+    timings = run_trace(
+        Engine(),
+        [Arrival(0.0, Request("zero", (1,), 1))],
+        clock=clock.read,
+    )
+
+    assert len(timings) == 1
+    assert timings[0].submitted_s == pytest.approx(4.0)
+    assert timings[0].emitted_s == pytest.approx((4.01,))
+    assert timings[0].completed_s == pytest.approx(4.01)
+
+
+def test_replay_never_sleeps_for_negative_duration():
+    class FakeClock:
+        now = 0.0
+        reads = 0
+
+        def read(self):
+            self.reads += 1
+            if self.reads == 4:
+                self.now = 0.02
+            return self.now
+
+        def sleep(self, duration):
+            assert duration >= 0
+            self.now += duration
+
+    clock = FakeClock()
+
+    class Engine:
+        active = False
+
+        @property
+        def has_work(self):
+            return self.active
+
+        def submit(self, request):
+            self.active = True
+
+        def step(self):
+            self.active = False
+            clock.now += 0.01
+            return [TokenEvent("race", 1, "length")]
+
+    timings = run_trace(
+        Engine(),
+        [Arrival(0.01, Request("race", (1,), 1))],
+        clock=clock.read,
+        sleep=clock.sleep,
+    )
+
+    assert len(timings) == 1
+    assert timings[0].emitted_s
+
+
+def test_replay_rejects_requests_without_completion_events():
+    class Engine:
+        active = False
+
+        @property
+        def has_work(self):
+            return self.active
+
+        def submit(self, request):
+            self.active = True
+
+        def step(self):
+            self.active = False
+            return []
+
+    with pytest.raises(ValueError, match="incomplete"):
+        run_trace(
+            Engine(),
+            [Arrival(0.0, Request("incomplete", (1,), 1))],
+            clock=lambda: 0.0,
+        )

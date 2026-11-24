@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from time import perf_counter, sleep as wait
 from typing import TYPE_CHECKING
 
-from tinyserve.requests import Request
+from tinyserve.requests import Request, TokenEvent
 
 if TYPE_CHECKING:
     from tinyserve.engine import Engine
@@ -89,4 +89,69 @@ def run_trace(
         sleep: Callable[[float], None] = wait,
 ) -> list[RequestTiming]:
     """Lab 08. Replay a sorted trace and record observed token event times."""
-    raise NotImplementedError("Lab 08: replay arrivals against a real engine")
+
+    if len(trace) == 0:
+        return []
+
+    def on_submit(request_id: str, submit_s: float, states: dict[str, dict]):
+        if request_id not in states:
+            states[request_id] = {
+                "submitted_s": submit_s,
+                "emitted_s": list(),
+                "completed_s": None,
+            }
+
+    def on_step(token_events: list[TokenEvent], step_s: float, states: dict[str, dict]):
+        for event in token_events:
+            state = states[event.request_id]
+            if event.token_id is not None:
+                state["emitted_s"].append(step_s)
+            if event.finish_reason:
+                state["completed_s"] = step_s
+
+    replay_start = clock()
+    replay_states = dict()
+
+    idx = 0
+    while idx < len(trace) or engine.has_work:
+        if idx >= len(trace):
+            # all request has been submitted, just engine step is ok
+            events = engine.step()
+            on_step(events, clock(), replay_states)
+            continue
+        # exist un-submit request, and engine may be still working
+        # submit waiting batch
+        i = idx
+        current = clock()
+        wait_for_submit = []
+        while i < len(trace) and replay_start + trace[i].at_s <= current:
+            wait_for_submit.append(trace[i])
+            i = i + 1
+        for r in wait_for_submit:
+            engine.submit(r.request)
+            on_submit(r.request.request_id, clock(), replay_states)
+        idx = i
+
+        if engine.has_work:
+            events = engine.step()
+            on_step(events, clock(), replay_states)
+        else:
+            # this means engine has no work, and no waiting request has been submitted
+            # just sleep
+            if idx >= len(trace):
+                break
+            current = clock()
+            if replay_start + trace[idx].at_s > current:
+                sleep(replay_start + trace[idx].at_s - current)
+
+    timings = []
+    for req_id, state in replay_states.items():
+        if state["completed_s"] is None:
+            raise ValueError(f"Request: {req_id} has not completed yet")
+        timings.append(RequestTiming(
+            request_id=req_id,
+            submitted_s=state["submitted_s"],
+            emitted_s=(*state["emitted_s"],),
+            completed_s=state["completed_s"],
+        ))
+    return timings
