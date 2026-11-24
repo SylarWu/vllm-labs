@@ -4,35 +4,29 @@
 
 异步语法与 `asyncio`、ASGI 工具包的基础解释见 [Python 异步语法与工具包](python_async.md)。
 
-## 本 lab 在整条推理链路中的位置
+## Lab 01～07 的整体串联
 
-Lab 01～06 已得到同步 Engine：调用一次 `submit` 提交请求，调用一次 `step` 推进一个 iteration，并返回本 tick 的 `TokenEvent`；调用 `cancel` 可在 tick 边界退休请求并回收分页 KV。
+| Lab | 这一层解决什么 | 交给下一层什么 |
+| --- | --- | --- |
+| [01 · Qwen3 Forward](lab01_model.md) | 用加载好的权重对 token IDs 执行 embedding、RMSNorm、RoPE、因果 GQA、SwiGLU 和残差计算。 | 每个输入位置的词表 logits。 |
+| [02 · 单请求生成](lab02_cache.md) | Prefill 消费 prompt 并写入 KV，从最后一个 prompt 位置的 logits 采样首 token。后续 decode 每步输入上次采样的 token，用绝对位置继续写 KV。 | 可逐轮推进的自回归生成和 `KVStore` 接口。 |
+| [03 · 分页地址](lab03_paging.md) | `BlockPool` 管页的分配与回收，`BlockTable` 把请求的逻辑 token 位置映射为物理 slot。 | 可跨非连续物理页访问的地址映射。 |
+| [04 · 迭代级调度](lab04_scheduler.md) | Scheduler 在 tick 边界按 FIFO 接纳请求，用 `plan()` 产出 `Step`，用 `complete()` 推进状态，遇到 EOS、长度上限或取消时退休。 | 每轮要执行的 token、位置和采样决定，以及按请求标识的 `TokenEvent`。 |
+| [05 · 分页 Engine](lab05_engine.md) | `PagedStorage` 持有所有请求共享的物理 K/V 张量，`PagedKV` 是单个请求跨 tick 的视图。Engine 准入时预留页，串起计划、forward、采样、状态提交和回收。 | 同步的 `submit / step / cancel` 接口。 |
+| [06 · 张量批处理](lab06_batch.md) | 把同 tick 的 decode 行合成一次模型调用，各行保留自己的 KV、绝对位置和有效长度。先给 decode 分配预算，再用剩余预算推进 prefill chunk。 | 能在同一 tick 推进多个请求的 Engine。中间 prefill chunk 只写 KV，最后一段才采样首 token。 |
+| [07 · HTTP / SSE](#请求状态与输出路由) | 校验请求并做 HTTP 准入，异步流在同步 tick 之间让出事件循环。按 `request_id` 路由输出，累计解码并在入队时固定每条 delta。 | 同一后端的 `ChatEvent` 可聚合成普通 JSON，也可逐条编码成 SSE。断流时沿生成器关闭链回收资源。 |
 
-Lab 07 在其外增加异步服务层：
+### 用 A、B 两条请求走一遍
 
-```text
-HTTP 请求
-  → 校验模型、messages、max_tokens、temperature
-  → 获取 inflight 准入名额
-  → ChatRequest
-  → EngineChatBackend.stream
-  → Request(request_id, prompt_ids, max_new_tokens, eos_token_id)
-  → Engine.submit
-  → Engine.step（多个请求共享 tick）
-  → TokenEvent(request_id, token_id, finish_reason)
-  → 按 request_id 路由、累计 token 并解码
-  → ChatEvent(delta, finish_reason)
-  → 普通 JSON 或 SSE
-  → 正常结束 / 客户端断流
-  → 关闭 async generator、取消未完成请求、释放准入名额
-```
+假设引擎能同时接纳 A、B，每轮 token 预算至少为 3，`max_prefill_chunk=2`。A 的 prompt 有 2 个 token，B 有 3 个，两条请求的输出上限都是 2，且本例未采到 EOS。B 在 A 首次 prefill 完成后到达。右列描述各 tick 使哪些帧可交付，实际发送时间由各自的流决定。
 
-这里有两层不同的“流”：
+| 时刻 | 调度、计算和 KV | HTTP / SSE |
+| --- | --- | --- |
+| Tick 1 | A 被接纳并预留页。A 的 prefill 写 prompt KV，从最后一个位置采样 `a1`。 | Backend 将 A 的 `TokenEvent` 转为 `ChatEvent`，A 的流可发送首个 JSON 帧。 |
+| Tick 2 | A 用 `a1` 做 decode。B 同轮被接纳，处理前两个 prompt token。Engine 用一次混合批次执行两行，A 采样 `a2`，达到长度上限并归还页。B 只写 KV、推进 prompt 游标。 | A 的末个 JSON 帧携带 `finish_reason="length"`，随后发送 `[DONE]`。B 本轮无业务帧。 |
+| Tick 3 | B 吃完最后一个 prompt token、采样 `b1`。 | B 的首块进入 `await send` 时断流，响应关闭 body，body 关闭 backend。Backend 取消仍活跃的 B，Engine 回收其 KV 页，响应外层归还 HTTP 名额。 |
 
-- `EngineChatBackend.stream` 是 Python 异步生成器，输出与协议无关的 `ChatEvent`。
-- FastAPI 的 `StreamingResponse` 是 HTTP/ASGI 响应体，把 `ChatEvent` 编码为 SSE 字节。
-
-保持这两层分离，才能用同一后端同时支持普通响应和 SSE，也才能独立测试请求路由与 HTTP 序列化。
+回看这条链路时，区分三个边界。**计算边界**由 `Step` 决定本轮消费哪些 token、是否采样。**状态边界**由 `complete()` 或 `cancel()` 决定请求何时退休和归还 KV 页。**交付边界**由 HTTP 响应消费生成器并控制发送，Engine 已退休的最后一个 token 仍可留在队列里等待交付。SSE 的 `[DONE]` 标记业务流结束，HTTP 名额由响应退出时的清理归还。 [Lab 06 的整体串联](lab06_batch.md#lab-0106-的整体串联) · [首块断流实测](#父类退出后关闭-body-与最新复验)
 
 ## 单一 Engine owner 与协作式调度
 
