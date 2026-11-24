@@ -13,7 +13,7 @@
 | 05 | 分页 KV 与端到端 Engine | 已完成，`3 passed`；Lab 01～05 回归 `23 passed, 1 skipped`，PagedKV 跨 tick 生命周期已复验 | [Lab 05](learning_notes/lab05_engine.md) |
 | 06 | 真 batch decode 与 chunked prefill | 已完成，`15 passed`；Lab 01～06 回归 `38 passed, 1 skipped`，混合 batch、事件契约与 KV 生命周期已复验 | [Lab 06](learning_notes/lab06_batch.md) |
 | 07 | FastAPI、SSE 与取消 | 已完成，`23 passed`；Lab 01～07 回归 `61 passed, 1 skipped` | [Lab 07](learning_notes/lab07_api.md) |
-| 08 | 指标、压测与官方 vLLM 对照 | 已开始，先实现 `summarize`，再实现 `run_trace` | [Lab 08](learning_notes/lab08_bench.md) |
+| 08 | 指标、压测与官方 vLLM 对照 | 进行中；`summarize` 聚焦验收 `2 passed, 1 deselected`，代码复盘清理后实现 `run_trace` | [Lab 08](learning_notes/lab08_bench.md) |
 
 ## 通用资料
 
