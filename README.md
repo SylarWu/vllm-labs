@@ -111,6 +111,8 @@ QWEN_MODEL_DIR="$PWD/models/Qwen3-0.6B" QWEN_DEVICE=cuda \
 python -m scripts.serve --model-dir models/Qwen3-0.6B --device cuda
 ```
 
+在 Windows 浏览器打开 [http://localhost:7789/chat](http://localhost:8000/chat)，即可流式对话。页面把本轮消息和历史一起发给模型，对话记录保存在当前页面内，刷新页面或点「新对话」即可清空。
+
 另一个 WSL 终端调用：
 
 ```bash

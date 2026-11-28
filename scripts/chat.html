@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qwen3 本地对话</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font: 16px/1.6 system-ui, sans-serif;
+      color: #192729;
+      background: #f4f6f3;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main {
+      max-width: 48rem;
+      height: 100dvh;
+      margin: auto;
+      padding: 1rem;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+    }
+    header, .actions { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+    header { padding-bottom: .75rem; border-bottom: 1px solid #d3dbd3; }
+    h1 { margin: 0; font-size: 1.2rem; }
+    #messages { overflow: auto; padding: 1rem .25rem; display: flex; flex-direction: column; gap: .85rem; }
+    .message { width: fit-content; max-width: 88%; padding: .55rem .9rem; border-radius: .8rem; }
+    .user { align-self: flex-end; background: #deebe4; }
+    .assistant { align-self: flex-start; background: #fff; border: 1px solid #d3dbd3; }
+    .role { display: block; font-size: .78rem; color: #405b53; }
+    .content { white-space: pre-wrap; overflow-wrap: anywhere; }
+    form { display: grid; gap: .6rem; padding-top: .7rem; }
+    textarea, button { font: inherit; border: 1px solid #aab9af; border-radius: .55rem; }
+    textarea { width: 100%; padding: .6rem .8rem; resize: vertical; min-height: 3.4rem; max-height: 26vh; }
+    button { padding: .3rem .8rem; color: #17372e; background: #fff; cursor: pointer; white-space: nowrap; }
+    #send { background: #225445; color: #fff; border-color: #225445; }
+    button:disabled { opacity: .5; cursor: default; }
+    :focus-visible { outline: 2px solid #1a7157; outline-offset: 2px; }
+    #status { min-height: 1.6em; margin: 0; color: #405b53; font-size: .875rem; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Qwen3 本地对话</h1>
+      <button id="reset" type="button" disabled>新对话</button>
+    </header>
+    <section id="messages" aria-label="对话记录"></section>
+    <form id="composer">
+      <textarea id="prompt" rows="2" required aria-label="消息" placeholder="输入消息"></textarea>
+      <div class="actions">
+        <p id="status" role="status"></p>
+        <button id="stop" type="button" hidden>停止</button>
+        <button id="send" type="submit">发送</button>
+      </div>
+    </form>
+  </main>
+  <script>
+    const composer = document.querySelector('#composer');
+    const prompt = document.querySelector('#prompt');
+    const messages = document.querySelector('#messages');
+    const status = document.querySelector('#status');
+    const reset = document.querySelector('#reset');
+    const stop = document.querySelector('#stop');
+    const send = document.querySelector('#send');
+    const history = [];
+    const maxTokens = 128;
+    let running;
+
+    function appendMessage(role, text) {
+      const bubble = document.createElement('article');
+      bubble.className = `message ${role}`;
+      const label = document.createElement('strong');
+      label.className = 'role';
+      label.textContent = role === 'user' ? '你' : 'Qwen3';
+      const content = document.createElement('div');
+      content.className = 'content';
+      content.textContent = text;
+      bubble.append(label, content);
+      messages.append(bubble);
+      return { bubble, content };
+    }
+
+    async function streamReply(response, onDelta) {
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let pending = '';
+      let finishReason;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) throw new Error('连接在模型完成回复前断开。');
+          pending += value;
+          const lines = pending.split('\n');
+          pending = lines.pop();
+          for (const line of lines) {
+            if (!line.startsWith('data:')) continue;
+            const data = line.slice(5).trim();
+            if (data === '[DONE]') return finishReason;
+            const choice = JSON.parse(data).choices[0];
+            onDelta(choice.delta.content);
+            if (choice.finish_reason) finishReason = choice.finish_reason;
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
+      }
+    }
+
+    composer.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const text = prompt.value.trim();
+      if (!text || running) return;
+
+      const user = { role: 'user', content: text };
+      const userRow = appendMessage('user', text);
+      const reply = appendMessage('assistant', '');
+      messages.scrollTop = messages.scrollHeight;
+      running = new AbortController();
+      prompt.value = '';
+      prompt.disabled = true;
+      send.hidden = true;
+      stop.hidden = false;
+      reset.disabled = true;
+      status.textContent = '等待首个 token…';
+
+      let answer = '';
+      let keepTurn = false;
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: running.signal,
+          body: JSON.stringify({
+            model: 'qwen3-lab', messages: [...history, user],
+            max_tokens: maxTokens, temperature: 0, stream: true,
+          }),
+        });
+        if (!response.ok) {
+          const error = await response.json().catch(() => null);
+          throw new Error(error?.detail || `请求失败 (${response.status})`);
+        }
+        const finishReason = await streamReply(response, (delta) => {
+          if (!delta) return;
+          const atBottom = messages.scrollHeight - messages.clientHeight - messages.scrollTop < 32;
+          answer += delta;
+          reply.content.textContent = answer;
+          status.textContent = '生成中…';
+          if (atBottom) messages.scrollTop = messages.scrollHeight;
+        });
+        keepTurn = Boolean(answer.trim());
+        if (!keepTurn) {
+          status.textContent = '模型返回了空回复。';
+        } else {
+          status.textContent = finishReason === 'length' ? `已达到本轮 ${maxTokens} token 上限。` : '';
+        }
+      } catch (error) {
+        const stopped = running.signal.aborted;
+        keepTurn = stopped && Boolean(answer.trim());
+        status.textContent = stopped ? '已停止生成。' : error.message;
+      } finally {
+        if (keepTurn) {
+          history.push(user, { role: 'assistant', content: answer });
+        } else {
+          userRow.bubble.remove();
+          reply.bubble.remove();
+          prompt.value = text;
+        }
+        running = undefined;
+        prompt.disabled = false;
+        send.hidden = false;
+        stop.hidden = true;
+        reset.disabled = history.length === 0;
+        prompt.focus();
+      }
+    });
+
+    stop.addEventListener('click', () => running?.abort());
+    reset.addEventListener('click', () => {
+      history.length = 0;
+      messages.replaceChildren();
+      status.textContent = '';
+      prompt.value = '';
+      reset.disabled = true;
+      prompt.focus();
+    });
+  </script>
+</body>
+</html>
